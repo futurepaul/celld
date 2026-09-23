@@ -2467,14 +2467,24 @@ impl RuntimeManager {
             js::abort_request_for_shutdown(request_id);
         }
         let result = receive.await.context("cell isolate dropped alarm result")?;
-        let final_write = drive.await.expect("cell alarm drive task panicked")?;
-        // A cancelled or failed alarm settles its claim in the drive's final
-        // isolate turn. The event reply is itself held behind every wake-entry
-        // arm, so waiting for the drive makes that final cache authoritative
-        // before the core sees completion.
         match result {
-            Ok((alarm, wrote)) => Ok((alarm, self.alarm_covered(&cell, alarm), wrote)),
+            // A handler that returned settled its claim in its completion
+            // turn (`Answer::Alarm`), so the snapshot and the delta it replied
+            // with are final. A completed cell event keeps its pending I/O
+            // (`completed_cell_event`), and that work runs on in the drive
+            // under the handler budget, as it does after a fetch. Waiting for
+            // it here held the core's `Firing` state, and with it every
+            // re-arm, until the operation deadline.
+            Ok((alarm, wrote)) => {
+                drive.detach();
+                Ok((alarm, self.alarm_covered(&cell, alarm), wrote))
+            }
             Err(error) => {
+                // A cancelled or failed alarm settles its claim in the drive's
+                // final isolate turn. The event reply is itself held behind
+                // every wake-entry arm, so waiting for the drive makes that
+                // final cache authoritative before the core sees completion.
+                let final_write = drive.await.expect("cell alarm drive task panicked")?;
                 // The drive completed its final isolate turn before this
                 // branch. Its alarm cache is therefore authoritative even
                 // when the handler failed: `Some` is the automatic retry or
