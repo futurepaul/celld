@@ -2348,6 +2348,8 @@ pub(crate) async fn dispatch_forwarded_rpc(
 mod peer_tunnel;
 #[path = "main/websocket.rs"]
 mod websocket;
+#[path = "main/native_seam.rs"]
+mod native_seam; // fork seam
 use websocket::{handle_websocket, outbound_websocket_task};
 
 async fn handle_ingress(
@@ -2442,6 +2444,9 @@ async fn dispatch_asset_call(app: AppHandle, call: AssetCallReq) {
 }
 
 async fn dispatch_service_call(app: AppHandle, call: SvcCallReq) {
+    if let Some(service) = fragment_native::lookup(&call.script) {
+        return native_seam::call(service, call).await; // fork seam
+    }
     // The target request owns a streamed body once it starts. Keep a fallback
     // guard here as well, so a missing runtime or a cancellation before
     // admission cannot leave the source in the process registry.

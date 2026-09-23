@@ -260,6 +260,7 @@ fn dependencies_of(loaded: &LoadedDeployment) -> VecDeque<Dependency> {
     loaded
         .services
         .iter()
+        .filter(|(_, script, _)| !fragment_native::is_native(script)) // fork seam
         .map(|(_, script, _)| Dependency::Service(script.clone()))
         .chain(queues.into_iter().map(Dependency::Queue))
         .collect()

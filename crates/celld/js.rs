@@ -328,6 +328,8 @@ pub struct SvcCallReq {
     /// Owns a streamed body until the target installs its request context.
     pub body_guard: RequestBodyGuard,
     pub headers: Vec<(String, String)>,
+    /// fork seam: the calling cell's scope, from the active event's gate.
+    pub caller: Option<String>,
     pub reply: tokio::sync::oneshot::Sender<Result<HttpResponse>>,
 }
 static SVC_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcCallReq>> = OnceLock::new();
@@ -10037,6 +10039,7 @@ fn op_svc_call_impl(
         body,
         body_guard,
         headers,
+        caller: gate.cell_scope().map(str::to_string), // fork seam
         reply: tx,
     };
     let stream_service = http_stream_service();
@@ -11448,6 +11451,7 @@ fn op_fetch(
             body: body.unwrap_or_else(|| RequestBody::Bytes(Vec::new().into())),
             body_guard,
             headers,
+            caller: gate.cell_scope().map(str::to_string), // fork seam
             reply: tx,
         };
         let stream_service = http_stream_service();
