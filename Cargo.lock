@@ -983,19 +983,35 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "url",
 ]
 
 [[package]]
 name = "fragment-native"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "base64 0.22.1",
  "fragment-core",
+ "fragment-nip98",
  "getrandom 0.3.4",
  "hex",
- "hmac",
+ "hkdf",
+ "reqwest",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "fragment-nip98"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "k256",
+ "serde_json",
+ "sha2",
+ "url",
 ]
 
 [[package]]
@@ -1673,6 +1689,19 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "k256"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
+dependencies = [
+ "cfg-if",
+ "ecdsa",
+ "elliptic-curve",
+ "sha2",
+ "signature",
 ]
 
 [[package]]
