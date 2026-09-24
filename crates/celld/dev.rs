@@ -36,6 +36,9 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
 #[derive(Debug)]
 struct Options {
     project: Option<PathBuf>,
+    /// fork: projects co-hosted beside it (`--with`), each deployed under its
+    /// own name only, for the application's service bindings.
+    with: Vec<PathBuf>,
     clean: bool,
     stack: StackOptions,
 }
@@ -333,7 +336,7 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--with PROJECT]... [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. A configuration change does not migrate the\n\
@@ -341,13 +344,14 @@ state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Its entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --with PROJECT         Co-host another project, deployed under its own name\n                         for PROJECT's service bindings; repeat as needed\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
 
 fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Options>> {
     let mut project = None;
+    let mut with = Vec::new();
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
     let mut clean = false;
@@ -359,6 +363,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--clean" => clean = true,
+            "--with" => with.push(PathBuf::from(arguments.next().context("--with requires a value")?)),
             "--logs" => logs = true,
             "--no-watch" => watch = false,
             "--watch-ignore" => {
@@ -395,6 +400,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     }
     Ok(Some(Options {
         project,
+        with,
         clean,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
@@ -448,9 +454,19 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         "{:x}",
         Sha256::digest(project.as_os_str().as_encoded_bytes())
     );
+    let mut with = Vec::new();
+    for other in options.with {
+        let other = deploy::resolve_config(Some(other))?;
+        with.push(
+            std::fs::canonicalize(&other)
+                .with_context(|| format!("resolve Wrangler config {}", other.display()))?,
+        );
+        console.detail("With", &with[with.len() - 1].display().to_string());
+    }
     let store = open_store(state.path(), &console).await?;
     run_stack(
         &config,
+        &with,
         state.path(),
         options.stack,
         &project_hash,
@@ -511,27 +527,38 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         .collect())
 }
 
-async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Result<()> {
+/// Deploys the co-hosted projects under their own names, then the
+/// application, whose pointer moves last.
+async fn deploy_project(config: &Path, with: &[PathBuf], store: &Store, logs: bool) -> anyhow::Result<()> {
     let bucket = open_local_bucket(&store.database)?;
-    let built = deploy::build(&deploy::Options {
-        config: Some(config.to_path_buf()),
-        bucket: None,
-        endpoint: None,
-        region: None,
-        dry_run: false,
-        json: false,
-        vars: read_dev_vars(config)?,
-        local_images: true,
-    })?;
-    if logs {
-        built.report();
-    }
     crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built).await
+    for (project, named) in with.iter().map(|p| (p.as_path(), true)).chain([(config, false)]) {
+        let built = deploy::build(&deploy::Options {
+            config: Some(project.to_path_buf()),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+            vars: read_dev_vars(project)?,
+            local_images: true,
+            named,
+        })?;
+        if logs {
+            built.report();
+        }
+        if named {
+            deploy::write_named(&bucket, &built).await?;
+        } else {
+            deploy::write(&bucket, &built).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_stack(
     config: &Path,
+    with: &[PathBuf],
     state: &Path,
     options: StackOptions,
     project_hash: &str,
@@ -552,7 +579,7 @@ async fn run_stack(
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(config, store, options.logs).await?;
+    deploy_project(config, with, store, options.logs).await?;
     let mut running = start_node(
         state,
         options.listener,
@@ -578,7 +605,7 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                if let Err(error) = deploy_project(config, store, options.logs).await {
+                if let Err(error) = deploy_project(config, with, store, options.logs).await {
                     console.failure(&format!("reload failed: {error:#}"));
                     continue;
                 }

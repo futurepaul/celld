@@ -207,6 +207,9 @@ pub struct Options {
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
+    /// fork: publish only the script's own pointer (`--named`), for another
+    /// script's service binding to load; the fleet's application stays.
+    pub named: bool,
 }
 
 pub fn print_help() {
@@ -214,7 +217,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --named                Publish only this script's own pointer: a service\n                         binding of the fleet's application loads it, and the\n                         application stays the one deployed last without it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -243,6 +246,7 @@ pub fn options_from_arguments(
         local_images: false,
         json: false,
         vars: BTreeMap::new(),
+        named: false,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -250,6 +254,7 @@ pub fn options_from_arguments(
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
             "--json" => options.json = true,
+            "--named" => options.named = true,
             "--config" => {
                 options.config = Some(PathBuf::from(
                     arguments.next().context("--config requires a value")?,
@@ -848,6 +853,18 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    write_as(bucket, built, true).await
+}
+
+/// fork: writes a deployment and its named pointer only. A service binding
+/// of the fleet's application loads it, and the fleet-wide pointer, the
+/// application selector, does not move (`celld deploy --named`, `celld dev
+/// --with`).
+pub async fn write_named(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    write_as(bucket, built, false).await
+}
+
+async fn write_as(bucket: &Bucket, built: &Built, fleet: bool) -> anyhow::Result<()> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -912,7 +929,9 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
         encoded.clone(),
     )
     .await?;
-    put_pointer(bucket, "deploy/current.json", encoded).await?;
+    if fleet {
+        put_pointer(bucket, "deploy/current.json", encoded).await?;
+    }
     Ok(())
 }
 
