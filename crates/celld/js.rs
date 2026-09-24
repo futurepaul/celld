@@ -4207,6 +4207,14 @@ enum WorkerOrigin {
     Dynamic,
 }
 
+/// fork: `CELLD_DYNAMIC_LOCKDOWN=1` takes from loaded workers the powers a
+/// tenant does not need and the host cannot meter: code generation from
+/// strings and `Atomics.wait` (docs/hardening.md, H3 in fragment-next).
+fn dynamic_lockdown() -> bool {
+    static LOCKDOWN: OnceLock<bool> = OnceLock::new();
+    *LOCKDOWN.get_or_init(|| std::env::var("CELLD_DYNAMIC_LOCKDOWN").is_ok_and(|v| v.trim() == "1"))
+}
+
 type ResourceLimits = crate::WorkerInvocationLimits;
 
 fn effective_resource_limits(
@@ -4756,6 +4764,9 @@ struct HeapLimitState {
     /// Recovery measures against this one because `near_heap_limit` raises
     /// the current one.
     limit: usize,
+    /// fork: how `near_heap_limit` ends the isolate's execution once it is
+    /// past twice its limit, with the reason its turn reports.
+    terminate: (v8::IsolateHandle, Arc<ActorRuntimeState>),
     last_gc_nudge: Mutex<Option<Instant>>,
     /// An explicit admission refusal cannot use the condemnation flag because
     /// recovery clears that flag at the next turn.
@@ -5235,6 +5246,24 @@ extern "C" fn near_heap_limit(
     // removes this callback before the isolate (and its slots) are destroyed.
     let state = unsafe { &*(data as *const HeapLimitState) };
     state.excessively_exceeded.store(true, Ordering::Relaxed);
+    // fork: past twice its limit, the isolate has had its extension and
+    // kept allocating. Ending its execution is the hard ceiling: without
+    // it, one tenant grows the node until the OS kills every tenant with
+    // it. The turn reports why; the extension below still lets V8 unwind.
+    // `try_lock`: this runs inside V8's allocator, on the isolate's thread.
+    if current_heap_limit >= state.limit.saturating_mul(2) {
+        let (handle, runtime) = &state.terminate;
+        if let Ok(mut termination) = runtime.termination.try_lock() {
+            if termination.is_none() {
+                *termination = Some(ExecutionTermination {
+                    error: format!("Worker exceeded its memory limit of {} MiB", state.limit / (1024 * 1024)),
+                    actor_scope: None,
+                    context_id: None,
+                });
+            }
+        }
+        handle.terminate_execution();
+    }
     // V8 fatally aborts the process if a near-limit callback does not extend
     // the limit. This reserve lets JS observe condemnation and unwind.
     //
@@ -8288,13 +8317,6 @@ impl Worker {
         // Dynamic `import()` of builtin specifiers; per-import()-call only.
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
-        let heap_limit_state = Arc::new(HeapLimitState {
-            excessively_exceeded: AtomicBool::new(false),
-            limit: original_heap_limit,
-            last_gc_nudge: Mutex::new(None),
-            #[cfg(celld_internal_tests)]
-            forced_admission_refusal: AtomicBool::new(false),
-        });
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress.clone(),
@@ -8302,6 +8324,14 @@ impl Worker {
             tail_reporting: config.tail_reporting,
             script_name: script_name.to_string(),
             ..Default::default()
+        });
+        let heap_limit_state = Arc::new(HeapLimitState {
+            excessively_exceeded: AtomicBool::new(false),
+            limit: original_heap_limit,
+            terminate: (isolate.thread_safe_handle(), runtime_state.clone()),
+            last_gc_nudge: Mutex::new(None),
+            #[cfg(celld_internal_tests)]
+            forced_admission_refusal: AtomicBool::new(false),
         });
         let loader_owner = LoaderOwner::fresh(script_name, config.generation);
         let heap_limit_state_ptr =
@@ -8320,6 +8350,11 @@ impl Worker {
         }));
         isolate.add_near_heap_limit_callback(near_heap_limit, heap_limit_state_ptr);
         let (context, fetch) = {
+            // fork: a loaded worker (tenant code) may not block its thread in
+            // `Atomics.wait`, which the CPU watchdog cannot see
+            if config.origin == WorkerOrigin::Dynamic && dynamic_lockdown() {
+                isolate.set_allow_atomics_wait(false);
+            }
             v8::scope!(let hs, &mut isolate);
             let context = v8::Context::new(hs, Default::default());
             let cs = &mut v8::ContextScope::new(hs, context);
@@ -8345,6 +8380,11 @@ impl Worker {
             module
                 .instantiate_module(scope, resolve_external)
                 .ok_or_else(|| anyhow!("instantiate: {}", exc!(scope)))?;
+            // fork: nor compile code from strings (`eval`, `new Function`):
+            // it runs what it was loaded with. Set before its first line runs.
+            if config.origin == WorkerOrigin::Dynamic && dynamic_lockdown() {
+                context.set_allow_generation_from_strings(false);
+            }
             let ev = match module.evaluate(scope) {
                 Some(value) => value,
                 None => {
@@ -10163,9 +10203,17 @@ fn take_loader_owner(owner: &LoaderOwner) -> Vec<tokio::sync::watch::Receiver<Lo
 // Keep admission policy inside the registry: a caller-selected bound would let
 // different entry points disagree about how much process capacity remains.
 const MAX_LOADED_WORKERS: usize = 256;
-// Reserve only the final process slot. A fixed fraction needlessly reduces
-// single-script capacity without giving every competing principal a share.
-const MAX_LOADED_WORKERS_PER_PRINCIPAL: usize = MAX_LOADED_WORKERS - 1;
+
+/// fork: `CELLD_LOADED_WORKERS_MAX` sets the process bound (a node's
+/// operator, and tests that fill it). Reserve only the final process slot
+/// per principal. A fixed fraction needlessly reduces single-script
+/// capacity without giving every competing principal a share.
+fn max_loaded_workers() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("CELLD_LOADED_WORKERS_MAX").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n >= 2).unwrap_or(MAX_LOADED_WORKERS)
+    })
+}
 
 /// Check both limits and install the live state under one registry lock. A
 /// separate check and insert lets concurrent isolates exceed either limit.
@@ -10174,7 +10222,8 @@ fn admit_loaded_worker(
     state: tokio::sync::watch::Receiver<LoaderState>,
 ) -> Result<u64, String> {
     let mut registry = loader_registry().lock().unwrap();
-    let principal_limit = MAX_LOADED_WORKERS_PER_PRINCIPAL;
+    let max = max_loaded_workers();
+    let principal_limit = max - 1;
     let principal_count = registry
         .values()
         .filter(|entry| entry.owner.principal == owner.principal)
@@ -10185,9 +10234,9 @@ fn admit_loaded_worker(
             owner.principal.script, owner.principal.generation
         ));
     }
-    if registry.len() >= MAX_LOADED_WORKERS {
+    if registry.len() >= max {
         return Err(format!(
-            "worker loader: too many loaded workers (limit {MAX_LOADED_WORKERS})"
+            "worker loader: too many loaded workers (limit {max})"
         ));
     }
 
