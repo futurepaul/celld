@@ -2976,16 +2976,28 @@ impl CellJob {
 thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
-    static HTTP: reqwest::Client = reqwest::Client::new();
-    static HTTP_MANUAL: reqwest::Client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    // Each client carries the node's egress policy (egress.rs): with
+    // CELLD_EGRESS_PUBLIC_ONLY, names resolve to public addresses only and a
+    // redirect to a non-public IP literal is refused.
+    static HTTP: reqwest::Client = crate::egress::client(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            match crate::egress::redirect_refused(attempt.url()) {
+                Some(refused) => attempt.error(refused),
+                None => attempt.follow(),
+            }
+        })));
+    static HTTP_MANUAL: reqwest::Client = crate::egress::client(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none()));
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
-    static HTTP_ERROR: reqwest::Client = reqwest::Client::builder()
+    static HTTP_ERROR: reqwest::Client = crate::egress::client(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             attempt.error("fetch redirect mode is error")
-        })).build().unwrap();
+        })));
     static DO_ID_KEYS: RefCell<HashMap<String, [u8; 32]>> = RefCell::new(HashMap::new());
 }
 
@@ -3005,6 +3017,9 @@ fn fetch_request_error(error: &reqwest::Error) -> String {
     loop {
         if let Some(limit) = source.downcast_ref::<RedirectSubrequestLimit>() {
             return limit.0.clone();
+        }
+        if let Some(refused) = source.downcast_ref::<crate::egress::EgressRefused>() {
+            return refused.0.clone();
         }
         let Some(next) = source.source() else {
             return format!("fetch: {error}");
@@ -11456,6 +11471,12 @@ fn op_fetch(
         rv.set(promise);
         return;
     }
+    // A non-public IP literal skips the resolver: refuse it before it leaves.
+    if crate::egress::public_only() {
+        if let Some(refused) = crate::egress::literal_refused(&url) {
+            return loader_throw(scope, &refused.0);
+        }
+    }
     // Select the client only for direct egress: a broker must not initialize
     // an unused network client and its TLS stack.
     let client = match redirect.as_str() {
@@ -13939,20 +13960,20 @@ impl IoContext {
         self.redirect_client
             .get_or_init(|| {
                 let context = Arc::downgrade(self);
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                        if attempt.previous().len() >= 10 {
-                            return attempt.error("too many redirects");
+                crate::egress::client(reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                    if attempt.previous().len() >= 10 {
+                        return attempt.error("too many redirects");
+                    }
+                    if let Some(refused) = crate::egress::redirect_refused(attempt.url()) {
+                        return attempt.error(refused);
+                    }
+                    if let Some(context) = context.upgrade() {
+                        if let Err(error) = context.charge_subrequest() {
+                            return attempt.error(RedirectSubrequestLimit(error));
                         }
-                        if let Some(context) = context.upgrade() {
-                            if let Err(error) = context.charge_subrequest() {
-                                return attempt.error(RedirectSubrequestLimit(error));
-                            }
-                        }
-                        attempt.follow()
-                    }))
-                    .build()
-                    .expect("build the redirect-counting HTTP client")
+                    }
+                    attempt.follow()
+                })))
             })
             .clone()
     }

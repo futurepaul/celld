@@ -82,7 +82,10 @@ it does not encrypt any traffic. The private network must therefore stay
 trusted, and the fleet HMAC does not replace this network boundary.
 
 celld does not terminate TLS on either listener. Do not expose the internal
-listener to the public internet. Use an encrypted overlay such as WireGuard or
+listener to the public internet. A Worker's own `fetch` runs in the same
+process as the peer client, so a network firewall cannot keep it off the
+private network; set `CELLD_EGRESS_PUBLIC_ONLY=1` to refuse non-public
+destinations, checked after a name is resolved. Use an encrypted overlay such as WireGuard or
 Tailscale when the network does not provide the required confidentiality.
 
 ## Use the internal operator API

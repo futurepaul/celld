@@ -214,6 +214,7 @@ pub fn validate() -> anyhow::Result<()> {
 
     for name in [
         "CELLD_CLOUD",
+        "CELLD_EGRESS_PUBLIC_ONLY",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
         "CELLD_TRUST_FORWARDED_HEADERS",

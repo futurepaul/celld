@@ -1027,6 +1027,7 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_NODE` | An explicit node-session ID. Use 1 to 128 ASCII letters, numbers, dots, dashes, or underscores. The value cannot be `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |
+| `CELLD_EGRESS_PUBLIC_ONLY` | Set to `1` to limit a Worker's own `fetch` to public addresses: a name resolves to its public addresses only (a name with none is refused), and a URL or redirect that names a loopback, private, link-local, shared, or unique-local IP is refused. The error starts with `egress refused:`. Use it when the private network carries the internal listener. Service bindings and Durable Object calls are not affected |
 | `CELLD_ACTIVATIONS` | The limit for concurrent cold-cell activations (default: 8 for each available CPU, at least 16 and at most 128). A cold activation waits on the object store for most of its time, so the default is above the CPU count |
 | `CELLD_DEPLOY_POLL_S` | The interval in seconds at which a node reads the deployment pointer and adopts a new deployment in place (default: 30) |
 | `CELLD_DEPLOY_MAX_AGE_S` | How long a resident Durable Object can keep the previous deployment's code after an adoption before celld forces the move (default: 60; 0 forces at once) |
