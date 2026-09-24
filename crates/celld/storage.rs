@@ -1314,6 +1314,7 @@ pub(crate) fn open_embedded(
         }
         transaction.commit()?;
     }
+    cap_facet(&connection)?;
     finish_open(
         scope,
         connection,
@@ -1328,6 +1329,25 @@ pub(crate) fn open_embedded(
             root_observed: parent.root_observed,
         },
     )
+}
+
+/// fork: `CELLD_FACET_MAX_BYTES` caps a facet's database. Its whole image
+/// is copied into the root after every changed turn, so an unbounded facet
+/// costs its root, the replicator, and the node. SQLite refuses a write
+/// past the cap (`SQLITE_FULL`, "database or disk is full"), which rolls
+/// the turn's transaction back; JS cannot raise it (the authorizer denies
+/// the pragma). An image already over the cap keeps its size and cannot
+/// grow. Unset, facets are uncapped, as upstream.
+fn facet_max_bytes() -> Option<u64> {
+    static MAX: OnceLock<Option<u64>> = OnceLock::new();
+    *MAX.get_or_init(|| std::env::var("CELLD_FACET_MAX_BYTES").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0))
+}
+
+fn cap_facet(connection: &Connection) -> anyhow::Result<()> {
+    let Some(max) = facet_max_bytes() else { return Ok(()) };
+    let page_size: u64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    connection.pragma_update(None, "max_page_count", (max / page_size.max(1)).max(1))?;
+    Ok(())
 }
 
 /// Copy a facet's private in-memory SQLite image into the root actor database.
