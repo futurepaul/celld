@@ -646,6 +646,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |
+| `CELLD_EGRESS_PUBLIC_ONLY` | Set to `1` to limit a Worker's own `fetch` to public addresses: a name keeps its public addresses only (a name with none is refused), and a URL or redirect that names a loopback, private, link-local, shared, or unique-local IP is refused with `egress refused:`. Use it when the private network carries the internal listener. Service bindings and Durable Object calls are not affected |
 | `CELLD_ACTIVATIONS` | Concurrent cold-cell activations (default: 8 per CPU, at least 16, at most 128) |
 | `CELLD_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
 | `CELLD_DEPLOY_MAX_AGE_S` | Seconds before celld forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |
