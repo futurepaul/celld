@@ -2890,12 +2890,30 @@ async fn handle_public(
     Ok(result)
 }
 
+/// fork: `CELLD_INTERNAL_PEER_ONLY=1` serves only the fleet-signed routes
+/// on the internal listener (`/peer/*`, `/runtime/`). The operator routes
+/// (`/state`, `/do/`, `/cell/`, `/evict/`, `/reload`, `/rebalance/*`,
+/// `/shutdown`) carry no authentication, so anything that reaches the
+/// private network could read every resident cell, drive any Durable
+/// Object with forged headers, or stop the node. A node that sets this is
+/// stopped by its signal, as a Fly Machine is.
+fn internal_peer_only() -> bool {
+    static PEER_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PEER_ONLY.get_or_init(|| std::env::var("CELLD_INTERNAL_PEER_ONLY").is_ok_and(|v| v.trim() == "1"))
+}
+
 async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
     shutdown: mpsc::UnboundedSender<ShutdownMode>,
 ) -> Result<HttpReply, Infallible> {
     let path = request.uri().path().to_string();
+    if internal_peer_only() && !path.starts_with("/peer/") && !path.starts_with("/runtime/") {
+        return Ok(response(
+            StatusCode::FORBIDDEN,
+            "{\"error\":\"this node serves only fleet-signed peer routes on its internal listener (CELLD_INTERNAL_PEER_ONLY)\"}",
+        ));
+    }
     let draining = app.is_draining();
     let do_scope = path.strip_prefix("/do/");
     let cell_scope = path.strip_prefix("/cell/");
