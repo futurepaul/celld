@@ -21,8 +21,9 @@ check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
 disallowed_macros = "forbid"
 
 [dependencies]
-# fork seam: native services (fragment-next crates/native)
-fragment-native = { path = "../../../../fragment-next-worktrees/native-services/crates/native" }
+# fork seam: native services, from fragment-next checked out beside this
+# repository as `fragment/` (crates/native there; docs/hardening.md)
+fragment-native = { path = "../../../fragment/crates/native" }
 async-trait.workspace = true
 chrono.workspace = true
 aes.workspace = true
