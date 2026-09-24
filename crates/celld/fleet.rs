@@ -605,7 +605,11 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    deploy::write(&store, &built).await?;
+    if options.named {
+        deploy::write_named(&store, &built).await?;
+    } else {
+        deploy::write(&store, &built).await?;
+    }
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),
@@ -625,7 +629,11 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         location,
         dry_run: false,
     })?;
-    note!("Nodes adopt this version at their next pointer poll, without a restart.");
+    if options.named {
+        note!("Only its own pointer moved: nodes load it with the next deployment of the script that binds it.");
+    } else {
+        note!("Nodes adopt this version at their next pointer poll, without a restart.");
+    }
     out.finish()
 }
 
