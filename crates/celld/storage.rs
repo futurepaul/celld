@@ -1134,6 +1134,7 @@ pub(crate) fn open_embedded(
         transaction.execute(&format!("UPDATE {table} SET scope=?1"), [scope])?;
     }
     transaction.commit()?;
+    cap_facet(&connection)?;
     finish_open(
         scope,
         connection,
@@ -1150,6 +1151,25 @@ pub(crate) fn open_embedded(
             root_observed: parent.root_observed,
         },
     )
+}
+
+/// fork: `CELLD_FACET_MAX_BYTES` caps a facet's database, a per-app quota
+/// (each facet is its own SQLite file and replication stream since v0.6.0,
+/// so this bounds one app's disk and replication, not its root's). SQLite
+/// refuses a write past the cap (`SQLITE_FULL`, "database or disk is
+/// full"), which rolls the turn's transaction back; JS cannot raise it (the
+/// authorizer denies the pragma). A database already over the cap keeps its
+/// size and cannot grow. Unset, facets are uncapped, as upstream.
+fn facet_max_bytes() -> Option<u64> {
+    static MAX: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| std::env::var("CELLD_FACET_MAX_BYTES").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0))
+}
+
+fn cap_facet(connection: &Connection) -> anyhow::Result<()> {
+    let Some(max) = facet_max_bytes() else { return Ok(()) };
+    let page_size: u64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    connection.pragma_update(None, "max_page_count", (max / page_size.max(1)).max(1))?;
+    Ok(())
 }
 
 /// Delete the legacy `_cf_FACETS` images of a facet and every facet below it,
