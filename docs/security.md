@@ -51,6 +51,11 @@ Every path to a runtime class therefore demands the fleet secret. The HMAC
 does not authenticate tunnel bytes after establishment and does not encrypt
 traffic, so it does not replace the private network.
 
+A Worker's own `fetch` runs in the same process as the peer client, so a
+network firewall cannot keep it off the private network. Set
+`CELLD_EGRESS_PUBLIC_ONLY=1` to refuse non-public destinations, checked after
+a name is resolved.
+
 ## Use the internal operator API
 
 The operator API is an alpha interface. A release can change its paths or
