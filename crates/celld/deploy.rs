@@ -374,12 +374,20 @@ impl Default for BundleConfig {
     }
 }
 
-/// One `containers[]` entry as written, before its image is resolved.
+/// One `containers[]` entry as written, before its images are resolved.
 #[derive(Clone, Debug, serde::Serialize)]
 struct ContainerDecl {
     class_name: String,
     /// A Dockerfile path relative to the project, or an image reference.
-    image: String,
+    /// Required under the `default` scheduling policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    /// The named images a Durable Object picks from in `start()`, under
+    /// the `durable_object` scheduling policy.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    images: BTreeMap<String, ImageDecl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduling_policy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -388,6 +396,20 @@ struct ContainerDecl {
     max_instances: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime: Option<String>,
+}
+
+/// One named image of `containers[].images`: a Dockerfile to build, or a
+/// reference to pull, as Wrangler takes it.
+#[derive(Clone, Debug, serde::Serialize)]
+struct ImageDecl {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dockerfile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_context: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    build_vars: BTreeMap<String, String>,
 }
 
 struct ProjectAssets {
@@ -577,23 +599,42 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let platform = (!options.local_images).then(|| {
         std::env::var("CELLD_CONTAINER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string())
     });
-    let images = project
-        .containers
-        .iter()
-        .map(|decl| resolve_image(&root, &decl.image, platform.as_deref()))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let container_specs: Vec<ContainerSpec> = project
-        .containers
-        .iter()
-        .zip(&images)
-        .map(|(decl, image)| ContainerSpec {
+    let mut container_specs: Vec<ContainerSpec> = Vec::new();
+    for decl in &project.containers {
+        let image = decl
+            .image
+            .as_deref()
+            .map(|image| resolve_image(&root, image, platform.as_deref()))
+            .transpose()?;
+        let images = decl
+            .images
+            .iter()
+            .map(|(name, image)| {
+                Ok((
+                    name.clone(),
+                    resolve_named_image(&root, image, platform.as_deref())?,
+                ))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        container_specs.push(ContainerSpec {
             class_name: decl.class_name.clone(),
-            image: image.clone(),
+            image,
+            images,
+            scheduling_policy: decl.scheduling_policy.clone(),
             instance_type: decl.instance_type.clone(),
             max_instances: decl.max_instances,
             runtime: decl.runtime.clone(),
-        })
-        .collect();
+        });
+    }
+    // Every image a node may be asked to start, each saved once.
+    let mut images: Vec<String> = Vec::new();
+    for spec in &container_specs {
+        for image in spec.image.iter().chain(spec.images.values()) {
+            if !images.contains(image) {
+                images.push(image.clone());
+            }
+        }
+    }
     if !container_specs.is_empty() {
         project.metadata["containers"] = json!(container_specs);
     }
@@ -601,7 +642,13 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // node runs it once, privileged, to fence its bridges before the first
     // container starts. Built like an app image, keyed by content, so every
     // deployment made by one celld shares one tar.
-    let fence_image = (!container_specs.is_empty())
+    // The krun engine fences each VM itself (its own network namespace and
+    // egress proxy), so a deployment for its nodes carries no fence.
+    let krun = matches!(
+        crate::container::EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref()),
+        Ok(crate::container::EngineChoice::Krun(_))
+    );
+    let fence_image = (!container_specs.is_empty() && !krun)
         .then(|| resolve_fence_image(platform.as_deref()))
         .transpose()?;
     let started = Instant::now();
@@ -787,23 +834,82 @@ fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
 /// builds, so their hash names the image everywhere: in the manifest, in
 /// the bucket key, and as the tag every engine holds it under.
 fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Result<String> {
-    let platform_args = platform
-        .map(|platform| vec!["--platform", platform])
-        .unwrap_or_default();
-    let id = if is_dockerfile(root, image) {
-        let path = root.join(image);
-        let context = path
+    if let Some(resolved) = already_resolved(image) {
+        return Ok(resolved);
+    }
+    if is_dockerfile(root, image) {
+        let id = build_image(root, image, None, &BTreeMap::new(), platform)?;
+        return content_reference(&id);
+    }
+    pull_image(image, platform)
+}
+
+/// One named image of `containers[].images`.
+fn resolve_named_image(
+    root: &Path,
+    image: &ImageDecl,
+    platform: Option<&str>,
+) -> anyhow::Result<String> {
+    match (&image.dockerfile, &image.image) {
+        (Some(dockerfile), None) => {
+            let id = build_image(
+                root,
+                dockerfile,
+                image.build_context.as_deref(),
+                &image.build_vars,
+                platform,
+            )?;
+            content_reference(&id)
+        }
+        (None, Some(reference)) => pull_image(reference, platform),
+        _ => bail!("a named image is one of `dockerfile` and `image`"),
+    }
+}
+
+/// `docker build` of `dockerfile` (relative to the project) in `context`
+/// (relative to the project; the Dockerfile's directory by default), with
+/// `vars` as build arguments; the built image's id.
+fn build_image(
+    root: &Path,
+    dockerfile: &str,
+    context: Option<&str>,
+    vars: &BTreeMap<String, String>,
+    platform: Option<&str>,
+) -> anyhow::Result<String> {
+    let path = root.join(dockerfile);
+    let context = match context {
+        Some(context) => root.join(context),
+        None => path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.to_path_buf());
-        let path = path.display().to_string();
-        let context = context.display().to_string();
-        let mut args = vec!["build", "-q"];
-        args.extend(&platform_args);
-        args.extend(["-f", &path, &context]);
-        run_engine(&args, "build container image")?
-    } else {
+            .unwrap_or_else(|| root.to_path_buf()),
+    };
+    let path = path.display().to_string();
+    let context = context.display().to_string();
+    let build_args: Vec<String> = vars
+        .iter()
+        .flat_map(|(name, value)| ["--build-arg".to_string(), format!("{name}={value}")])
+        .collect();
+    let mut args = vec!["build", "-q"];
+    if let Some(platform) = platform {
+        args.extend(["--platform", platform]);
+    }
+    args.extend(build_args.iter().map(String::as_str));
+    args.extend(["-f", &path, &context]);
+    run_engine(&args, "build container image")
+}
+
+/// An image reference pulled (unless already held for this machine) and
+/// named by its content.
+fn pull_image(image: &str, platform: Option<&str>) -> anyhow::Result<String> {
+    if let Some(resolved) = already_resolved(image) {
+        return Ok(resolved);
+    }
+    let platform_args = platform
+        .map(|platform| vec!["--platform", platform])
+        .unwrap_or_default();
+    let id = {
         let inspect = ["image", "inspect", "--format", "{{.Id}}", image];
         let held = platform.is_none() && run_engine(&inspect, "inspect container image").is_ok();
         if !held {
@@ -814,18 +920,32 @@ fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Re
         }
         run_engine(&inspect, "inspect container image")?
     };
+    content_reference(&id)
+}
+
+/// A reference that is already a content key (`celld-image:<sha256>`), as
+/// a node without a Docker CLI takes one: its engine was loaded with the
+/// image another machine built, so nothing here builds, pulls, or tags.
+fn already_resolved(image: &str) -> Option<String> {
+    let key = image.strip_prefix("celld-image:")?;
+    (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())).then(|| image.to_string())
+}
+
+/// The content key of an image the engine holds, tagged on it; see
+/// `crate::container::image_reference`.
+fn content_reference(id: &str) -> anyhow::Result<String> {
     let content = run_engine(
         &[
             "image",
             "inspect",
             "--format",
             "{{json .RootFS.Layers}}{{json .Config}}",
-            &id,
+            id,
         ],
         "inspect container image",
     )?;
     let reference = crate::container::image_reference(&format!("{:x}", Sha256::digest(&content)));
-    run_engine(&["tag", &id, &reference], "tag container image")?;
+    run_engine(&["tag", id, &reference], "tag container image")?;
     Ok(reference)
 }
 
@@ -2125,7 +2245,14 @@ fn read_containers(
         if let Some(key) = entry.keys().find(|key| {
             !matches!(
                 key.as_str(),
-                "class_name" | "image" | "name" | "instance_type" | "max_instances" | "runtime"
+                "class_name"
+                    | "image"
+                    | "images"
+                    | "scheduling_policy"
+                    | "name"
+                    | "instance_type"
+                    | "max_instances"
+                    | "runtime"
             )
         }) {
             bail!("config `containers[{index}]` declares `{key}`, which celld does not model");
@@ -2152,9 +2279,37 @@ fn read_containers(
         }
         let image = entry
             .get("image")
-            .and_then(Value::as_str)
-            .filter(|image| !image.is_empty())
-            .ok_or_else(|| anyhow!("config `containers[{index}].image` must be a string"))?;
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|image| !image.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("config `containers[{index}].image` must be a string"))
+            })
+            .transpose()?;
+        let scheduling_policy = entry
+            .get("scheduling_policy")
+            .map(|value| match value.as_str() {
+                Some(policy @ ("default" | "durable_object")) => Ok(policy.to_string()),
+                _ => Err(anyhow!(
+                    "config `containers[{index}].scheduling_policy` must be \"default\" or \"durable_object\""
+                )),
+            })
+            .transpose()?;
+        let images = match entry.get("images") {
+            None => BTreeMap::new(),
+            Some(value) => read_images(value, index)?,
+        };
+        if scheduling_policy.as_deref() == Some("durable_object") {
+            if images.is_empty() {
+                bail!(
+                    "config `containers[{index}]` has the durable_object scheduling policy and no \
+                     `images` for its Durable Objects to start"
+                );
+            }
+        } else if image.is_none() {
+            bail!("config `containers[{index}].image` must be a string");
+        }
         let name = entry
             .get("name")
             .map(|value| {
@@ -2205,7 +2360,9 @@ fn read_containers(
             .transpose()?;
         declared.push(ContainerDecl {
             class_name: class_name.to_string(),
-            image: image.to_string(),
+            image,
+            images,
+            scheduling_policy,
             name,
             instance_type,
             max_instances,
@@ -2213,6 +2370,73 @@ fn read_containers(
         });
     }
     Ok(declared)
+}
+
+/// `containers[].images`: names to a Dockerfile or a reference each.
+fn read_images(value: &Value, index: usize) -> anyhow::Result<BTreeMap<String, ImageDecl>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("config `containers[{index}].images` must be an object"))?;
+    let mut images = BTreeMap::new();
+    for (name, entry) in object {
+        let at = format!("config `containers[{index}].images.{name}`");
+        if name.is_empty() {
+            bail!("config `containers[{index}].images` names an image with an empty name");
+        }
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| anyhow!("{at} must be an object"))?;
+        if let Some(key) = entry.keys().find(|key| {
+            !matches!(
+                key.as_str(),
+                "dockerfile" | "image" | "build_context" | "build_vars"
+            )
+        }) {
+            bail!("{at} declares `{key}`, which celld does not model");
+        }
+        let text = |key: &str| -> anyhow::Result<Option<String>> {
+            entry
+                .get(key)
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow!("{at}.{key} must be a non-empty string"))
+                })
+                .transpose()
+        };
+        let (dockerfile, image) = (text("dockerfile")?, text("image")?);
+        if dockerfile.is_some() == image.is_some() {
+            bail!("{at} names one of `dockerfile` and `image`");
+        }
+        let build_context = text("build_context")?;
+        let mut build_vars = BTreeMap::new();
+        if let Some(vars) = entry.get("build_vars") {
+            let vars = vars
+                .as_object()
+                .ok_or_else(|| anyhow!("{at}.build_vars must be an object of strings"))?;
+            for (key, value) in vars {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{at}.build_vars.{key} must be a string"))?;
+                build_vars.insert(key.clone(), value.to_string());
+            }
+        }
+        if image.is_some() && (build_context.is_some() || !build_vars.is_empty()) {
+            bail!("{at} builds nothing from an `image`; `build_context` and `build_vars` go with a `dockerfile`");
+        }
+        images.insert(
+            name.clone(),
+            ImageDecl {
+                dockerfile,
+                image,
+                build_context,
+                build_vars,
+            },
+        );
+    }
+    Ok(images)
 }
 
 fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Result<()> {

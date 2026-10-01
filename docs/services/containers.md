@@ -27,14 +27,23 @@ belong to the same script. celld gives such an object a `ctx.container` handle,
 and an object of any other class has none. A Worker therefore addresses a
 container the way it addresses an object, with a name or an id.
 
-celld implements `running`, `start()`, `monitor()`, `destroy()`, `signal()`,
-`getTcpPort()`, `exec()`, and `setInactivityTimeout()`. `start()` accepts
-`entrypoint`, `env`, `enableInternet`, and `labels`. It checks `hardTimeout`
-and then ignores it, so a value of 0 or less throws and a valid value changes
-nothing. `inspect()`, the snapshot methods, and the outbound interception
-methods reject with an error. Read the
+celld implements `running`, `images`, `start()`, `monitor()`, `destroy()`,
+`signal()`, `getTcpPort()`, `exec()`, `inspect()`, and `setInactivityTimeout()`
+on both engines (see [Two engines](#two-engines)), and `snapshotContainer()`,
+`interceptOutboundHttp()`, `interceptOutboundHttps()`, and
+`interceptAllOutboundHttp()` on the krun engine. `start()` accepts `image`,
+`containerSnapshot`, `instance`, `entrypoint`, `env`, `enableInternet`, and
+`labels`, with Cloudflare's limits: at most 10 labels, names of 1 to 16 bytes,
+values of at most 64. `image` is one of the class's images. It checks
+`hardTimeout` and then ignores it, so a value of 0 or less throws and a valid
+value changes nothing. `destroy()` stops a container whose `start()` is still
+under way. `exec()` accepts `pty` and `signal`, and its process has `isPty` and
+`resize()`. `snapshotDirectory()` and `interceptOutboundTcp()` reject with an
+error. Read the
 [`ctx.container` reference](https://developers.cloudflare.com/durable-objects/api/container/)
-for the standard method list.
+for the standard method list. The
+[conformance example](../../examples/container-conformance) calls every method
+and answers a verdict per method, on either engine and on Cloudflare.
 
 A request reaches the container through a port, and not through a public
 address. `getTcpPort(port).fetch()` opens a connection from the node to the
@@ -95,6 +104,36 @@ default socket of Docker, Docker Desktop, OrbStack, or Podman. A `DOCKER_HOST`
 value that is not a `unix://` URL gives celld no socket at all. A node without
 an engine cannot activate a cell of a container class, and it serves every other
 class.
+
+A `containers` entry with `scheduling_policy: "durable_object"` declares
+`images`, a name for each Dockerfile or image reference, and no `image`;
+`ctx.container.images` maps each name to its reference, and an object passes
+one to `start()`. A reference that is already a content key,
+`celld-image:<sha256>`, is taken as it is, so a machine without the `docker`
+CLI deploys an image that another machine built and loaded into the node's
+engine.
+
+## Two engines
+
+`CELLD_CONTAINER_ENGINE` selects the node's engine: `docker`, the default, or
+`krun:<path>`, the socket of a libkrun microVM engine that speaks Cloudflare's
+container API itself (fragment's `sandcastle-engine`). Its `ports.sock` is in
+the same directory.
+
+On the krun engine, each container is a virtual machine in its own jail, cgroup,
+and network namespace, so the engine and not a node-wide fence enforces
+`enableInternet`, and a deployment for krun nodes carries no fence image. The
+engine routes an intercepted request to a socket of celld's, which dispatches it
+to the binding the object passed, on the service-call path; HTTPS interception
+uses the CA at `/etc/cloudflare/certs/cloudflare-containers-ca.crt`, as on
+Cloudflare. `getTcpPort()` reaches a port through a loopback listener per port,
+whose connections take a socket from the engine, TCP over the VM's network
+interface or a relay to the guest's loopback.
+
+The Docker engine has no snapshots and no interception, and those calls reject
+with an error naming the engine. Its `exec()` inherits the container's whole
+environment, and its `kill()` signals a process by a pid that the daemon reports
+from the host's namespace, so it can miss the process.
 
 ![A Worker on any node is routed to the node that owns the cell, where a V8 isolate and a container process run on two sides of the container engine socket, behind an nftables fence on the node's bridge, and a move destroys the container](containers-flow.svg)
 
@@ -184,19 +223,23 @@ enforces no fleet cap.
 
 ## Differences from Cloudflare
 
-- A `containers` entry accepts `class_name`, `image`, `name`, `instance_type`,
-  `max_instances`, and `runtime`. Each other key stops the deployment. celld
-  adds `runtime`, and it accepts `name` without using it.
+- A `containers` entry accepts `class_name`, `image`, `images`,
+  `scheduling_policy`, `name`, `instance_type`, `max_instances`, and `runtime`.
+  Each other key stops the deployment. celld adds `runtime`, and it accepts
+  `name` without using it.
 - celld places a container on the node that owns the cell. Cloudflare can place
   a container away from its object.
-- A node that serves a container class needs a Docker daemon or a Podman daemon.
+- A node that serves a container class needs a Docker daemon, a Podman daemon,
+  or the krun engine.
 - celld does not enforce the disk size of an instance type.
 - `max_instances` converges across the fleet instead of holding centrally, so
   the fleet can exceed the cap for one refresh. `celld dev` enforces no cap.
-- `inspect()`, `snapshotDirectory()`, `snapshotContainer()`, and the outbound
-  interception methods reject with an error. `start()` checks `hardTimeout` and
-  then ignores it, so a value of 0 or less throws and a valid value has no
-  effect.
+- `snapshotDirectory()` and `interceptOutboundTcp()` reject with an error, and
+  on the Docker engine so do `snapshotContainer()` and the HTTP interception
+  methods. `start()` checks `hardTimeout` and then ignores it, so a value of 0
+  or less throws and a valid value has no effect.
+- On the Docker engine, `exec()` inherits the container's environment, not only
+  `PATH`, and its `kill()` can miss the process.
 - `getTcpPort(port).connect()` gives a socket with the lifetime of the event
   that opened it. See [TCP sockets](../cloudflare-compat.md#tcp-sockets).
 - A `monitor()` promise and an `exec()` process do not keep the object active
