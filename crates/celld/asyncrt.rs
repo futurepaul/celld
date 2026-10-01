@@ -165,6 +165,12 @@ impl<T> Unpin for TaskHandle<T> {}
 impl<T> TaskHandle<T> {
     /// Detach the task from its join handle.
     pub fn detach(self) {}
+
+    /// Cancel the task at its next await. Dropping the handle does not:
+    /// it detaches.
+    pub fn abort(&self) {
+        self.inner.abort();
+    }
 }
 
 impl<T> Future for TaskHandle<T> {

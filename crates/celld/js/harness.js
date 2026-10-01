@@ -2290,13 +2290,15 @@ class ContainerExecOutput {
   }
 }
 class ContainerExecProcess {
-  constructor(id, pid, stdinMode, stdoutMode, stderrMode) {
+  constructor(id, pid, stdinMode, stdoutMode, stderrMode, isPty) {
     this._id = id;
     this.pid = pid;
+    this.isPty = isPty;
     this._outputCalled = false;
     this._exitCode = null;
     this.stdout = stdoutMode === "pipe" ? __execStream(id, 1) : null;
-    this.stderr = stderrMode === "pipe" ? __execStream(id, 2) : null;
+    // A terminal has one output stream, its stdout.
+    this.stderr = stderrMode === "pipe" && !isPty ? __execStream(id, 2) : null;
     this.stdin = stdinMode === "pipe"
       ? new WritableStream({
         write: (chunk) => __container_exec_write(id, __bytesOf(chunk)),
@@ -2330,6 +2332,14 @@ class ContainerExecProcess {
   kill(signal = 15) {
     if (!__validSignal(signal)) throw new RangeError("Invalid signal number.");
     __container_exec_kill(this._id, signal).catch(() => {});
+  }
+  resize(cols, rows) {
+    if (!this.isPty) throw new TypeError("resize() requires a process started with pty.");
+    for (const value of [cols, rows]) {
+      if (!(Number.isInteger(value) && value >= 1 && value <= 65535))
+        throw new RangeError("Terminal dimensions must be integers from 1 to 65535.");
+    }
+    __container_exec_resize(this._id, cols, rows).catch(() => {});
   }
 }
 const __bytesOf = (chunk) => {
@@ -2384,6 +2394,25 @@ class ContainerPort {
       __container_address(this._scope, this._port), options);
   }
 }
+// Cloudflare's start() limits on labels and instances.
+const __CONTAINER_LABELS_MAX = 10;
+const __CONTAINER_LABEL_NAME_MAX = 16;
+const __CONTAINER_LABEL_VALUE_MAX = 64;
+const __CONTAINER_INSTANCES = ["lite", "basic", "standard-1", "standard-2", "standard-3", "standard-4"];
+const __utf8Length = (text) => new TextEncoder().encode(text).byteLength;
+// The binding's host route, as globalOutbound takes one: the host keeps it,
+// so an intercept outlives this isolate.
+const __interceptRoute = (binding, method) => {
+  const meta = __outboundMeta.get(binding);
+  if (meta === undefined)
+    throw new TypeError(`${method}() requires a Fetcher binding, such as ctx.exports.SomeEntrypoint.`);
+  const props = meta.propsSc ?? (meta.props === undefined
+    ? new Uint8Array() : __rpcOut(meta.props, false));
+  // The default export is no named entrypoint, as a service binding's
+  // fetch() takes it.
+  const entrypoint = meta.entrypoint === "default" ? null : (meta.entrypoint ?? null);
+  return { script: meta.script, entrypoint, props };
+};
 class Container {
   constructor(scope) {
     this._scope = scope;
@@ -2392,6 +2421,10 @@ class Container {
   // The host's answer, not a JavaScript flag: a monitor() promise can be
   // dropped with its event, so the flag it would maintain could go stale.
   get running() { return __container_running(this._scope); }
+  // The class's named images, digest-pinned, for start({ image }).
+  get images() {
+    return Object.freeze(JSON.parse(__container_images(this._scope)));
+  }
   start(options) {
     if (this.running)
       throw new Error("start() cannot be called on a container that is already running.");
@@ -2399,16 +2432,55 @@ class Container {
     const params = { enableInternet: !!o.enableInternet, labels: [] };
     if (o.entrypoint !== undefined) params.entrypoint = Array.from(o.entrypoint, String);
     params.env = __containerEnvList(o.env);
+    if (o.image !== undefined && o.containerSnapshot !== undefined)
+      throw new TypeError("start() takes an image or a containerSnapshot, not both.");
+    if (o.image !== undefined) {
+      if (typeof o.image !== "string" || o.image.length === 0)
+        throw new TypeError("image must be a non-empty string.");
+      params.image = o.image;
+    }
+    if (o.containerSnapshot !== undefined) {
+      const id = o.containerSnapshot?.id;
+      if (typeof id !== "string" || id.length === 0)
+        throw new TypeError("containerSnapshot must be a snapshot or an object with its id.");
+      params.containerSnapshot = id;
+    }
+    if (o.directorySnapshots !== undefined && Array.from(o.directorySnapshots).length > 0)
+      throw new Error("directorySnapshots is not supported by celld.");
+    if (o.instance !== undefined) {
+      if (typeof o.instance === "string") {
+        if (!__CONTAINER_INSTANCES.includes(o.instance))
+          throw new TypeError(`Unknown instance type: ${o.instance}`);
+        params.instance = o.instance;
+      } else if (o.instance !== null && typeof o.instance === "object") {
+        const { vcpu, memoryMib, diskMb } = o.instance;
+        for (const [name, value] of [["vcpu", vcpu], ["memoryMib", memoryMib], ["diskMb", diskMb]]) {
+          if (!(Number.isInteger(value) && value > 0))
+            throw new TypeError(`instance.${name} must be a positive integer.`);
+        }
+        params.instance = { vcpu, memoryMib, diskMb };
+      } else {
+        throw new TypeError("instance must be an instance type or { vcpu, memoryMib, diskMb }.");
+      }
+    }
     if (o.labels !== undefined) {
-      for (const [name, value] of Object.entries(o.labels)) {
+      const entries = Object.entries(o.labels);
+      if (entries.length > __CONTAINER_LABELS_MAX)
+        throw new RangeError(`A container takes at most ${__CONTAINER_LABELS_MAX} labels.`);
+      for (const [name, value] of entries) {
+        const text = String(value);
         if (name.length === 0) throw new Error("Label names cannot be empty");
-        for (const text of [name, String(value)]) {
-          for (let i = 0; i < text.length; i++) {
-            if (text.charCodeAt(i) < 0x20)
+        if (__utf8Length(name) > __CONTAINER_LABEL_NAME_MAX)
+          throw new RangeError(`Label names can contain at most ${__CONTAINER_LABEL_NAME_MAX} bytes.`);
+        if (__utf8Length(text) > __CONTAINER_LABEL_VALUE_MAX)
+          throw new RangeError(`Label values can contain at most ${__CONTAINER_LABEL_VALUE_MAX} bytes.`);
+        for (const part of [name, text]) {
+          for (let i = 0; i < part.length; i++) {
+            if (part.charCodeAt(i) < 0x20)
               throw new Error(`Label names cannot contain control characters (index ${i})`);
           }
         }
-        params.labels.push([name, String(value)]);
+        params.labels.push([name, text]);
       }
     }
     if (o.hardTimeout !== undefined && !(o.hardTimeout > 0))
@@ -2428,15 +2500,18 @@ class Container {
       this._destroyReason = undefined;
       throw error;
     }
-    const exitCode = Number(raw);
-    if (this._destroyReason !== undefined) {
-      const reason = this._destroyReason;
-      this._destroyReason = undefined;
-      throw reason;
+    const { code, destroyed } = JSON.parse(raw);
+    const reason = this._destroyReason;
+    this._destroyReason = undefined;
+    // destroy() ends a run cleanly unless it was given an error.
+    if (destroyed) {
+      if (reason !== undefined) throw reason;
+      return;
     }
-    if (exitCode !== 0) {
-      const error = new Error(`Container exited with unexpected exit code: ${exitCode}`);
-      error.exitCode = exitCode;
+    if (reason !== undefined) throw reason;
+    if (code !== 0) {
+      const error = new Error(`Container exited with unexpected exit code: ${code}`);
+      error.exitCode = code;
       throw error;
     }
   }
@@ -2459,6 +2534,8 @@ class Container {
   setInactivityTimeout(durationMs) {
     if (!(durationMs > 0))
       throw new Error(`setInactivityTimeout() requires durationMs > 0, got ${durationMs}`);
+    if (Number(durationMs) > 21600000)
+      throw new RangeError("setInactivityTimeout() takes at most 6 hours (21600000 ms).");
     return __container_inactivity(this._scope, durationMs);
   }
   async exec(cmd, options) {
@@ -2469,8 +2546,7 @@ class Container {
     const o = options ?? {};
     const stdoutMode = __execOutputMode(o.stdout, "stdout");
     const stderrMode = __execOutputMode(o.stderr, "stderr");
-    const combined = stderrMode === "combined";
-    if (combined && stdoutMode !== "pipe")
+    if (stderrMode === "combined" && stdoutMode !== "pipe")
       throw new TypeError('stderr: "combined" requires stdout to be "pipe".');
     if (o.cwd !== undefined && String(o.cwd).includes("\0"))
       throw new TypeError("cwd cannot contain '\\0' characters.");
@@ -2482,10 +2558,26 @@ class Container {
       else if (o.stdin instanceof ReadableStream) stdinMode = "stream";
       else throw new TypeError('stdin must be a ReadableStream or the string "pipe".');
     }
+    let pty = null;
+    if (o.pty !== undefined && o.pty !== false) {
+      const cols = o.pty === true ? 80 : (o.pty.cols ?? 80);
+      const rows = o.pty === true ? 24 : (o.pty.rows ?? 24);
+      for (const value of [cols, rows]) {
+        if (!(Number.isInteger(value) && value >= 1 && value <= 65535))
+          throw new RangeError("Terminal dimensions must be integers from 1 to 65535.");
+      }
+      pty = [cols, rows];
+    }
+    if (o.signal !== undefined && !(o.signal instanceof AbortSignal))
+      throw new TypeError("signal must be an AbortSignal.");
+    o.signal?.throwIfAborted();
     const params = {
       cmd: Array.from(cmd, String),
       env: __containerEnvList(o.env),
-      combined,
+      stdin: stdinMode !== "none",
+      stdout: stdoutMode,
+      stderr: stderrMode,
+      pty,
     };
     if (o.cwd !== undefined) params.cwd = String(o.cwd);
     if (o.user !== undefined) params.user = String(o.user);
@@ -2510,25 +2602,41 @@ class Container {
     } else if (stdinMode === "none") {
       __container_exec_close(id).catch(() => {});
     }
-    return new ContainerExecProcess(id, pid, stdinMode, stdoutMode, stderrMode);
+    // Aborting the signal ends the process with SIGKILL, as on Cloudflare.
+    o.signal?.addEventListener("abort",
+      () => __container_exec_kill(id, 9).catch(() => {}), { once: true });
+    return new ContainerExecProcess(id, pid, stdinMode, stdoutMode, stderrMode, pty !== null);
   }
-  inspect() {
-    return Promise.reject(new Error("inspect() is not implemented in celld"));
+  async inspect() {
+    return JSON.parse(__container_inspect(this._scope));
+  }
+  async snapshotContainer(options) {
+    const o = options ?? {};
+    if (o.name !== undefined && typeof o.name !== "string")
+      throw new TypeError("name must be a string.");
+    return JSON.parse(await __container_snapshot(this._scope, o.name ?? null));
+  }
+  async __intercept(method, scheme, addr, binding) {
+    if (typeof addr !== "string" || addr.length === 0)
+      throw new TypeError(`${method}() requires an address: a host, a glob, an ip:port, or a range.`);
+    const { script, entrypoint, props } = __interceptRoute(binding, method);
+    await __container_intercept(
+      this._scope,
+      JSON.stringify({ scheme, target: addr, script, entrypoint }),
+      props,
+    );
+  }
+  interceptOutboundHttp(addr, binding) {
+    return this.__intercept("interceptOutboundHttp", "http", addr, binding);
+  }
+  interceptOutboundHttps(addr, binding) {
+    return this.__intercept("interceptOutboundHttps", "https", addr, binding);
+  }
+  interceptAllOutboundHttp(binding) {
+    return this.__intercept("interceptAllOutboundHttp", "http", "*", binding);
   }
   snapshotDirectory() {
     return Promise.reject(new Error("snapshotDirectory() is not implemented in celld"));
-  }
-  snapshotContainer() {
-    return Promise.reject(new Error("snapshotContainer() is not implemented in celld"));
-  }
-  interceptOutboundHttp() {
-    return Promise.reject(new Error("interceptOutboundHttp() is not implemented in celld"));
-  }
-  interceptOutboundHttps() {
-    return Promise.reject(new Error("interceptOutboundHttps() is not implemented in celld"));
-  }
-  interceptAllOutboundHttp() {
-    return Promise.reject(new Error("interceptAllOutboundHttp() is not implemented in celld"));
   }
   interceptOutboundTcp() {
     return Promise.reject(new Error("interceptOutboundTcp() is not implemented in celld"));

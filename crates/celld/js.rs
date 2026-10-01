@@ -820,6 +820,25 @@ impl EgressGate {
     }
 }
 
+/// Whether `url` names a port of the calling cell's own container.
+fn own_container_port(context: &IoContext, url: &str) -> bool {
+    let Some(frame) = current_cell_event(context) else {
+        return false;
+    };
+    let cell = frame
+        .root
+        .as_ref()
+        .map(|root| root.cell.clone())
+        .unwrap_or_else(|| frame.storage.clone());
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (parsed.host_str(), parsed.port_or_known_default()) else {
+        return false;
+    };
+    crate::container::owns_address(&cell, host, port)
+}
+
 /// The cell event the executing JavaScript belongs to.
 ///
 /// The continuation's own context first, from CPED: V8 runs a promise
@@ -6741,6 +6760,11 @@ ops! { OP_NAMES, install_op_functions,
         "__container_exec_wait" => container::op_container_exec_wait,
         "__container_exec_kill" => container::op_container_exec_kill,
         "__container_exec_drop" => container::op_container_exec_drop,
+        "__container_exec_resize" => container::op_container_exec_resize,
+        "__container_inspect" => container::op_container_inspect,
+        "__container_images" => container::op_container_images,
+        "__container_snapshot" => container::op_container_snapshot,
+        "__container_intercept" => container::op_container_intercept,
         "__storage_get" => storage_ops::op_storage_get,
         "__storage_get_many" => storage_ops::op_storage_get_many,
         "__sql_ingest" => storage_ops::op_sql_ingest,
@@ -8724,10 +8748,15 @@ fn op_fetch(
         rv.set(promise);
         return;
     }
-    // A non-public IP literal skips the resolver: refuse it before it leaves.
+    // A non-public IP literal skips the resolver: refuse it before it leaves,
+    // unless it is the calling object's own container port, which the node
+    // handed it (`getTcpPort`). The cell comes from the active event, so
+    // JavaScript cannot name another cell's container.
     if crate::egress::public_only() {
         if let Some(refused) = crate::egress::literal_refused(&url) {
-            return loader_throw(scope, &refused.0);
+            if !own_container_port(&context, &url) {
+                return loader_throw(scope, &refused.0);
+            }
         }
     }
     // Select the client only for direct egress: a broker must not initialize
