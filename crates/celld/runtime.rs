@@ -815,6 +815,7 @@ impl RuntimeManager {
             manager.node.to_string(),
             bucket,
             manager.data_dir.as_ref().clone(),
+            Some(manager.clone()),
         );
         install_container_specs(&generation);
         Ok(manager)

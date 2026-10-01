@@ -6,9 +6,11 @@
 //! A cell of a class named in the deployment's `containers` config owns at
 //! most one container, named after the cell, on the node that owns the
 //! cell. The Durable Object supervises it through the ops in
-//! `js/container.rs`; this module performs the effects against the
-//! container engine, which is the Docker Engine API on a unix socket
-//! (Podman serves the same API).
+//! `js/container.rs`; this module performs the effects against a container
+//! engine behind the `Backend` trait: the Docker Engine API on a unix
+//! socket (Podman serves the same API, `container_docker`), or a libkrun
+//! microVM engine with Cloudflare's container API on its own socket
+//! (`container_krun`). `CELLD_CONTAINER_ENGINE` picks one.
 //!
 //! The container is bound to the cell's ownership on this node, not to its
 //! residency: an idle eviction leaves it running under an inactivity timer
@@ -18,31 +20,38 @@
 //! container's disk is ephemeral on Cloudflare too, so a takeover that
 //! starts fresh is conformant.
 //!
-//! Images travel through the bucket. `celld deploy` saves the image the
+//! Images travel through the bucket. `celld deploy` saves each image the
 //! config names as a tar at `deploy/images/<id>.tar`, and a node loads it
 //! into its engine the first time a cell of that class starts, so a node
 //! never talks to a registry.
 
 use crate::asyncrt;
-use crate::docker::{frame_header, Docker, Stream};
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use bytes::Bytes;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 /// One `containers[]` entry of a deployment, as the node sees it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainerSpec {
     pub class_name: String,
-    /// The image reference the engine starts, `celld-image:<content key>`,
-    /// so two deployments of one image share one tar and one load.
-    pub image: String,
+    /// The image a start that names none runs, `celld-image:<content key>`,
+    /// so two deployments of one image share one tar and one load. `None`
+    /// under the `durable_object` scheduling policy, whose objects name an
+    /// image of `images` in `start()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// `ctx.container.images`: names to the references `start()` takes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub images: BTreeMap<String, String>,
+    /// `default` (or none) or `durable_object`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,9 +61,16 @@ pub struct ContainerSpec {
     /// this class; `None` takes the node default. A node whose daemon does
     /// not have the runtime fails every start of the class, so the class
     /// runs only where its isolation is available. celld extends the
-    /// Cloudflare config here, which has no per-class runtime.
+    /// Cloudflare config here, which has no per-class runtime. Docker only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+}
+
+impl ContainerSpec {
+    /// Every image a cell of this class may start, the default first.
+    pub fn all_images(&self) -> impl Iterator<Item = &String> {
+        self.image.iter().chain(self.images.values())
+    }
 }
 
 /// The reference every engine holds an image under, from its content key.
@@ -90,19 +106,48 @@ pub fn instance_resources(instance_type: &str) -> Option<(f64, u64)> {
 /// The instance type of a class that declares none, as on Cloudflare.
 const DEFAULT_INSTANCE_TYPE: &str = "dev";
 
-/// The resolvers a container gets when it runs under a non-default runtime
-/// and the operator set none. gVisor's network stack does not reach
-/// Docker's embedded resolver at `127.0.0.11`, so a container under it
-/// cannot resolve a hostname though it reaches the Internet by address; a
-/// public resolver, which the fence permits, restores name resolution.
-/// `CELLD_CONTAINER_DNS` overrides this.
-const DEFAULT_CONTAINER_DNS: &[&str] = &["1.1.1.1", "1.0.0.1"];
+/// The size a start gives its container: a named type, or `start()`'s
+/// custom `{vcpu, memoryMib, diskMb}`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Instance {
+    Named(String),
+    Custom { vcpu: f64, memory_mib: u64, disk_mb: u64 },
+}
+
+impl Instance {
+    /// vCPUs (a fraction for the small types) and memory in bytes.
+    pub fn resources(&self) -> Option<(f64, u64)> {
+        match self {
+            Instance::Named(name) => instance_resources(name),
+            Instance::Custom {
+                vcpu, memory_mib, ..
+            } => Some((*vcpu, memory_mib * 1024 * 1024)),
+        }
+    }
+
+    /// The engine API's form, Cloudflare's.
+    pub fn to_json(&self) -> Value {
+        match self {
+            // celld's alias names, Cloudflare's names to the engine.
+            Instance::Named(name) => json!(match name.as_str() {
+                "dev" => "lite",
+                "standard" => "standard-1",
+                other => other,
+            }),
+            Instance::Custom {
+                vcpu,
+                memory_mib,
+                disk_mb,
+            } => json!({ "vcpu": vcpu, "memoryMib": memory_mib, "diskMb": disk_mb }),
+        }
+    }
+}
 
 /// The memory a container of this instance type reserves on the node. A
-/// class that declares none gets the default type, as `create_and_start`
-/// does. An unknown name is refused at deploy, so a running container
-/// always maps; this returns 0 for a name that somehow does not, which
-/// undercounts rather than blocks a sample.
+/// class that declares none gets the default type, as a start does. An
+/// unknown name is refused at deploy, so a running container always maps;
+/// this returns 0 for a name that somehow does not, which undercounts
+/// rather than blocks a sample.
 pub fn instance_memory_bytes(instance_type: Option<&str>) -> u64 {
     instance_resources(instance_type.unwrap_or(DEFAULT_INSTANCE_TYPE))
         .map(|(_, memory)| memory)
@@ -125,44 +170,20 @@ pub fn running_instances_by_class() -> std::collections::BTreeMap<String, u64> {
         engine.running_instances_by_class()
     })
 }
-/// Processes one container can hold. Cloudflare publishes no number; this
-/// is room for a build tool's process tree and far short of a fork bomb.
-const PIDS_LIMIT: u64 = 1024;
-/// The host interfaces of the two bridges, named so the fence can address
-/// them; Docker's default `br-<id>` changes with every recreation.
-const OPEN_BRIDGE: &str = "celld0";
-const INTERNAL_BRIDGE: &str = "celld1";
-const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
-/// The fence, installed on the node from a one-shot privileged container of
-/// the `celld-fence` image: a container may reach the Internet and nothing
-/// of the node's own. Hooks before Docker's own chains (priority filter -
-/// 10) so a verdict here is final. Input: no new connection from a bridge
-/// to the node itself, which is where the internal listener and the public
-/// listener bind; replies to connections the node opened still pass.
-/// Forward: nothing to the private ranges, where the fleet, the VPC, and
-/// the metadata service live. Rules on the host side of the bridge cover
-/// every runtime, gVisor included, and no process inside a container can
-/// see them, let alone remove them.
-const FENCE_RULES: &str = r#"table inet celld
-delete table inet celld
-table inet celld {
-  chain input {
-    type filter hook input priority -10; policy accept;
-    iifname { "celld0", "celld1" } ct state established,related accept
-    iifname { "celld0", "celld1" } reject
-  }
-  chain forward {
-    type filter hook forward priority -10; policy accept;
-    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
-    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
-  }
-}
-"#;
 
-/// Docker's bridge option that forbids traffic between two containers on
-/// the same bridge. The node still reaches every container, because it
-/// speaks from the host side of the bridge.
-const ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
+/// Whether `host:port` is a port this node handed `scope` for its own
+/// container (`getTcpPort`), which the public-only egress policy lets the
+/// object reach though it is a private address.
+pub fn owns_address(scope: &str, host: &str, port: u16) -> bool {
+    let Some(engine) = engine_if_ready() else {
+        return false;
+    };
+    let Some(cell) = engine.cell(scope) else {
+        return false;
+    };
+    let state = cell.state.lock().unwrap();
+    state.running && state.address.serves(host, port)
+}
 
 /// How a cell stop treats its container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,33 +210,162 @@ const DEFAULT_ENV: &[&str] = &[
     "CLOUDFLARE_APPLICATION_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
 ];
 
+/// Cloudflare's intercept entries per container: a hostname or a glob
+/// counts two (IPv4 and IPv6), an address or a range one.
+pub const INTERCEPT_ENTRIES_MAX: usize = 128;
+
 pub struct StartParams {
+    /// One of the class's images; `None` takes the class's default.
+    pub image: Option<String>,
+    /// A snapshot id to restore (`containerSnapshot`), in place of an image.
+    pub snapshot: Option<String>,
+    pub instance: Option<Instance>,
     pub entrypoint: Option<Vec<String>>,
     pub env: Vec<(String, String)>,
     pub enable_internet: bool,
     pub labels: Vec<(String, String)>,
 }
 
+/// What a backend starts: everything decided, nothing left to look up.
+pub(crate) struct Launch {
+    pub scope: String,
+    pub node: String,
+    pub class: String,
+    /// `None` when `snapshot` is the root.
+    pub image: Option<String>,
+    pub snapshot: Option<String>,
+    /// `NAME=value`, the defaults first.
+    pub env: Vec<String>,
+    pub labels: Vec<(String, String)>,
+    pub entrypoint: Option<Vec<String>>,
+    pub enable_internet: bool,
+    pub instance: Instance,
+    pub runtime: Option<String>,
+    pub intercepts: Vec<InterceptRule>,
+}
+
+/// How a run ended: the root process's code (137 for a kill), and whether
+/// `destroy()` ended it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunExit {
+    pub code: i64,
+    pub destroyed: bool,
+}
+
+/// One `interceptOutbound*` rule, in the engine's terms.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct InterceptRule {
+    /// `http` or `https`.
+    pub scheme: &'static str,
+    /// A host, a `*.` glob, `*`, an `ip:port`, or a range; an HTTPS host
+    /// may end in `:port`.
+    pub target: String,
+}
+
+impl InterceptRule {
+    /// Its entries in Cloudflare's count of 128.
+    pub fn entries(&self) -> usize {
+        let host = self.target.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':');
+        let address = self.target.contains('/')
+            || host.parse::<std::net::IpAddr>().is_ok()
+            || self.target.parse::<std::net::SocketAddr>().is_ok();
+        if address {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+/// Where an intercepted request goes: the binding's route, as
+/// `globalOutbound` keeps one, so it outlives the object's isolate.
+#[derive(Clone, Debug)]
+pub struct ServiceRoute {
+    pub generation: crate::generation::GenerationId,
+    pub script: String,
+    pub entrypoint: Option<String>,
+    pub props: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Intercept {
+    pub rule: InterceptRule,
+    pub route: ServiceRoute,
+}
+
+/// What `inspect()` answers for the current run.
+#[derive(Clone, Debug, Default)]
+struct RunInfo {
+    image: String,
+    labels: BTreeMap<String, String>,
+    from_snapshot: bool,
+    started: bool,
+    memory_bytes: u64,
+}
+
 #[derive(Default)]
 struct CellState {
     running: bool,
-    /// Where the node dials the container: the bridge address on Linux,
-    /// the published loopback ports elsewhere.
+    /// Where the node dials the container.
     address: Address,
     inactivity: Option<Duration>,
-    /// The pending destroy after an idle eviction. Dropping it cancels.
+    /// The pending destroy after an idle eviction, aborted when the cell
+    /// returns (dropping a task handle only detaches it).
     sweeper: Option<asyncrt::TaskHandle<()>>,
     /// Bumped per start so a wait from a previous run cannot report for
     /// this one.
     run: u64,
+    /// The run `destroy()` ended, so its exit reads as destroyed.
+    destroyed: Option<u64>,
+    info: RunInfo,
+    /// `interceptOutbound*` so far, in order: the engine names a match by
+    /// its index, and intercepts are only ever added.
+    intercepts: Vec<Intercept>,
 }
 
-#[derive(Clone, Debug, Default)]
-enum Address {
+/// Where the node reaches a container's ports.
+#[derive(Clone, Default)]
+pub(crate) enum Address {
     #[default]
     None,
+    /// Any port at this address (Docker's bridge on Linux).
     Ip(String),
+    /// Loopback ports the engine published (Docker elsewhere).
     Published(HashMap<u16, u16>),
+    /// A loopback listener per port, made on first use (the krun engine).
+    Forwarded(Arc<dyn PortForwarder>),
+}
+
+impl std::fmt::Debug for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Address::None => f.write_str("None"),
+            Address::Ip(ip) => write!(f, "Ip({ip})"),
+            Address::Published(ports) => write!(f, "Published({ports:?})"),
+            Address::Forwarded(_) => f.write_str("Forwarded"),
+        }
+    }
+}
+
+impl Address {
+    fn serves(&self, host: &str, port: u16) -> bool {
+        match self {
+            Address::None => false,
+            Address::Ip(ip) => ip == host,
+            Address::Published(ports) => host == "127.0.0.1" && ports.values().any(|p| *p == port),
+            Address::Forwarded(f) => host == "127.0.0.1" && f.serves(port),
+        }
+    }
+}
+
+/// Loopback listeners that reach a container's ports.
+pub(crate) trait PortForwarder: Send + Sync {
+    /// `127.0.0.1:<port>` for the container's `port`, listening.
+    fn address(&self, port: u16) -> Result<String, String>;
+    /// Whether this forwarder listens on loopback `port`.
+    fn serves(&self, port: u16) -> bool;
+    /// Stops every listener.
+    fn close(&self);
 }
 
 pub struct CellContainer {
@@ -230,12 +380,16 @@ pub struct CellContainer {
     /// an engine failure the wait could not attribute to the process.
     /// Written with `send_replace`: a plain `send` discards the value
     /// while nobody subscribes, and `monitor()` usually subscribes late.
-    exit: watch::Sender<Option<(u64, Result<i64, String>)>>,
+    exit: watch::Sender<Option<(u64, Result<RunExit, String>)>>,
 }
 
 impl CellContainer {
     pub fn running(&self) -> bool {
         self.state.lock().unwrap().running
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// `host:port` for `getTcpPort(port)`.
@@ -255,6 +409,7 @@ impl CellContainer {
                          must be declared with EXPOSE in the image"
                     )
                 }),
+            Address::Forwarded(forwarder) => forwarder.address(port),
             Address::None => Err(format!("The container is not listening on port {port}")),
         }
     }
@@ -273,6 +428,7 @@ impl CellContainer {
         state.run += 1;
         state.running = true;
         state.address = Address::None;
+        state.info = RunInfo::default();
         let run = state.run;
         drop(state);
         self.exit.send_replace(None);
@@ -283,26 +439,92 @@ impl CellContainer {
     pub fn current_run(&self) -> u64 {
         self.state.lock().unwrap().run
     }
+
+    /// `inspect()`: the running container's image and labels, or `None`.
+    /// The image is empty while it starts and when it came from a snapshot,
+    /// as on Cloudflare.
+    pub fn inspect(&self) -> Option<Value> {
+        let state = self.state.lock().unwrap();
+        if !state.running {
+            return None;
+        }
+        let image = if state.info.started && !state.info.from_snapshot {
+            state.info.image.clone()
+        } else {
+            String::new()
+        };
+        Some(json!({ "image": image, "labels": state.info.labels }))
+    }
+
+    /// `ctx.container.images`.
+    pub fn images(&self) -> &BTreeMap<String, String> {
+        &self.spec.images
+    }
+}
+
+/// One container engine: the effects `ContainerEngine` orchestrates.
+#[async_trait::async_trait]
+pub(crate) trait Backend: Send + Sync {
+    /// What the engine is, for messages.
+    fn kind(&self) -> &'static str;
+    /// Reap every container of `node` a previous process left behind.
+    async fn reap(&self, node: &str) -> anyhow::Result<()>;
+    /// What every start needs first (Docker: its bridges and the fence).
+    async fn prepare(&self) -> anyhow::Result<()>;
+    async fn has_image(&self, image: &str) -> anyhow::Result<bool>;
+    /// Loads a `docker save` tar holding `image`.
+    async fn load_image(&self, image: &str, tar: Bytes) -> anyhow::Result<()>;
+    /// The container of that name, if it runs: where its ports are.
+    async fn running(&self, name: &str) -> anyhow::Result<Option<Address>>;
+    async fn create_and_start(&self, name: &str, launch: Launch) -> anyhow::Result<Address>;
+    /// Waits for the root process to end.
+    async fn wait(&self, name: &str) -> anyhow::Result<RunExit>;
+    async fn signal(&self, name: &str, signal: u32) -> anyhow::Result<()>;
+    /// Ends and removes the container; idempotent, errors ignored.
+    async fn remove(&self, name: &str);
+    async fn exec(&self, name: &str, params: &ExecParams) -> anyhow::Result<ExecStarted>;
+    /// `snapshotContainer()`: `{id, size, name?}`.
+    async fn snapshot(&self, name: &str, snapshot_name: Option<String>) -> anyhow::Result<Value>;
+    /// The running container's intercepts, replaced whole (only ever grown).
+    async fn set_intercepts(&self, name: &str, intercepts: &[InterceptRule]) -> anyhow::Result<()>;
+    /// Whether `start()` may restore a snapshot.
+    fn restores_snapshots(&self) -> bool;
+    /// Whether the engine routes intercepted requests back to the object.
+    fn intercepts(&self) -> bool;
 }
 
 pub struct ContainerEngine {
-    /// See `Config::runtime`.
-    runtime: Option<String>,
-    /// See `Config::dns`.
-    dns: Vec<String>,
-    /// The absolute path of the container resolv.conf this engine wrote and
-    /// bind-mounts; `None` when it could not be written.
-    resolv_conf: Option<PathBuf>,
-    docker: Docker,
+    backend: Arc<dyn Backend>,
     node: String,
     bucket: Option<crate::bucket::Bucket>,
     /// Per-image load lock, so two cells of one class starting together
     /// load the tar once.
     images: Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>,
     cells: Mutex<HashMap<String, Arc<CellContainer>>>,
-    networks: tokio::sync::Mutex<Option<(String, String)>>,
-    /// Whether this process has installed the fence on the node's bridges.
-    fenced: tokio::sync::Mutex<bool>,
+}
+
+/// Which engine `CELLD_CONTAINER_ENGINE` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineChoice {
+    /// The Docker Engine API, found as `Docker::discover` finds it.
+    Docker,
+    /// The krun engine's API socket (`krun:<path>`); its `ports.sock` is
+    /// beside it.
+    Krun(PathBuf),
+}
+
+impl EngineChoice {
+    pub fn parse(value: Option<&str>) -> anyhow::Result<EngineChoice> {
+        match value.filter(|v| !v.is_empty()) {
+            None | Some("docker") => Ok(EngineChoice::Docker),
+            Some(v) => match v.strip_prefix("krun:") {
+                Some(path) if path.starts_with('/') => Ok(EngineChoice::Krun(PathBuf::from(path))),
+                _ => Err(anyhow!(
+                    "CELLD_CONTAINER_ENGINE is `docker` or `krun:<absolute path of the engine's socket>`"
+                )),
+            },
+        }
+    }
 }
 
 /// What the runtime told this module about the node: set once at start.
@@ -312,17 +534,18 @@ struct Config {
     /// `CELLD_CONTAINER_RUNTIME`: the OCI runtime every container starts
     /// under, such as `runsc` (gVisor) or `kata` (a VM). `None` is the
     /// daemon's default, which is `runc` unless the operator changed it. A
-    /// class can override it, see `ContainerSpec::runtime`.
+    /// class can override it, see `ContainerSpec::runtime`. Docker only.
     runtime: Option<String>,
-    /// `CELLD_CONTAINER_DNS`: the resolvers a container gets, overriding
-    /// `DEFAULT_CONTAINER_DNS`. Empty takes the default when a runtime is in
-    /// use and the daemon's otherwise.
+    /// `CELLD_CONTAINER_DNS`: the resolvers a container gets. Docker only;
+    /// see `container_docker`.
     dns: Vec<String>,
-    /// The node's state directory. celld writes the container resolv.conf
-    /// here and bind-mounts it, so the path must be the same on the host as
-    /// celld sees it; a self-hosted node runs celld as a host process, and
-    /// the lab mounts the directory one-to-one.
+    /// The node's state directory: the Docker engine's resolv.conf, the
+    /// krun engine's intercept socket.
     data_dir: PathBuf,
+    /// `CELLD_CONTAINER_ENGINE`.
+    choice: EngineChoice,
+    /// Where intercepted requests are dispatched.
+    runtime_manager: Option<crate::runtime::RuntimeManager>,
 }
 
 static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
@@ -335,7 +558,12 @@ static FENCE_IMAGE: RwLock<Option<String>> = RwLock::new(None);
 /// container class never opens the socket.
 static ENGINE: tokio::sync::OnceCell<Arc<ContainerEngine>> = tokio::sync::OnceCell::const_new();
 
-pub fn configure(node: String, bucket: Option<crate::bucket::Bucket>, data_dir: PathBuf) {
+pub fn configure(
+    node: String,
+    bucket: Option<crate::bucket::Bucket>,
+    data_dir: PathBuf,
+    runtime_manager: Option<crate::runtime::RuntimeManager>,
+) {
     let runtime = std::env::var("CELLD_CONTAINER_RUNTIME")
         .ok()
         .filter(|runtime| !runtime.is_empty());
@@ -345,12 +573,21 @@ pub fn configure(node: String, bucket: Option<crate::bucket::Bucket>, data_dir: 
         .map(|resolver| resolver.trim().to_string())
         .filter(|resolver| !resolver.is_empty())
         .collect();
+    let choice = match EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref()) {
+        Ok(choice) => choice,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "containers use Docker");
+            EngineChoice::Docker
+        }
+    };
     *CONFIG.write().unwrap() = Some(Config {
         node,
         bucket,
         runtime,
         dns,
         data_dir,
+        choice,
+        runtime_manager,
     });
 }
 
@@ -368,12 +605,17 @@ pub fn spec(class: &str) -> Option<Arc<ContainerSpec>> {
         .cloned()
 }
 
+/// The deployment's fence image, which the Docker engine runs once.
+pub(crate) fn fence_image() -> Option<String> {
+    FENCE_IMAGE.read().unwrap().clone()
+}
+
 /// The engine, connecting on the first call. A failure is returned rather
 /// than cached, so a daemon that comes up later is found by the next call.
 pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
     ENGINE
         .get_or_try_init(|| async {
-            let (node, bucket, runtime, dns, data_dir) = {
+            let (node, bucket, runtime, dns, data_dir, choice, runtime_manager) = {
                 let config = CONFIG.read().unwrap();
                 let config = config.as_ref().ok_or_else(|| {
                     anyhow!("the container engine is not configured on this node")
@@ -384,17 +626,28 @@ pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
                     config.runtime.clone(),
                     config.dns.clone(),
                     config.data_dir.clone(),
+                    config.choice.clone(),
+                    config.runtime_manager.clone(),
                 )
             };
-            let docker = Docker::discover().ok_or_else(|| {
-                anyhow!(
-                    "no container engine: set DOCKER_HOST to a unix socket, or run a Docker or \
-                     Podman daemon on this node"
-                )
-            })?;
-            Ok(Arc::new(
-                ContainerEngine::connect(docker, node, bucket, runtime, dns, data_dir).await?,
-            ))
+            let backend: Arc<dyn Backend> = match choice {
+                EngineChoice::Docker => {
+                    let docker = crate::docker::Docker::discover().ok_or_else(|| {
+                        anyhow!(
+                            "no container engine: set DOCKER_HOST to a unix socket, or run a \
+                             Docker or Podman daemon on this node"
+                        )
+                    })?;
+                    Arc::new(crate::container_docker::DockerBackend::new(
+                        docker, node.clone(), runtime, dns, &data_dir,
+                    ))
+                }
+                EngineChoice::Krun(socket) => Arc::new(
+                    crate::container_krun::KrunBackend::new(socket, &node, &data_dir, runtime_manager)
+                        .await?,
+                ),
+            };
+            Ok(Arc::new(ContainerEngine::connect(backend, node, bucket).await?))
         })
         .await
         .cloned()
@@ -414,7 +667,7 @@ pub async fn shutdown() {
     let Some(engine) = engine_if_ready() else {
         return;
     };
-    if let Err(error) = engine.reap().await {
+    if let Err(error) = engine.backend.reap(&engine.node).await {
         tracing::warn!(
             event = "container_shutdown_reap_failed",
             error = %format!("{error:#}"),
@@ -435,21 +688,24 @@ pub async fn prewarm() {
             return;
         }
     };
-    if let Err(error) = engine.ensure_fence().await {
+    if let Err(error) = engine.backend.prepare().await {
         tracing::warn!(
+            engine = engine.backend.kind(),
             error = %format!("{error:#}"),
-            "the container bridges are not fenced; no container starts on this node"
+            "the container engine is not ready; no container starts on this node"
         );
     }
     let specs = SPECS.read().unwrap().clone();
     for spec in specs {
-        if let Err(error) = engine.ensure_image(&spec.image).await {
-            tracing::warn!(
-                class = %spec.class_name,
-                image = %spec.image,
-                error = %format!("{error:#}"),
-                "container image is unavailable"
-            );
+        for image in spec.all_images() {
+            if let Err(error) = engine.ensure_image(image).await {
+                tracing::warn!(
+                    class = %spec.class_name,
+                    image = %image,
+                    error = %format!("{error:#}"),
+                    "container image is unavailable"
+                );
+            }
         }
     }
 }
@@ -460,95 +716,23 @@ impl ContainerEngine {
     /// containers still belong to cells it will own again, and a container
     /// whose object has lost track of it is a leak, so a restart starts
     /// clean. The next `start()` of each object creates a fresh one.
-    pub async fn connect(
-        docker: Docker,
+    async fn connect(
+        backend: Arc<dyn Backend>,
         node: String,
         bucket: Option<crate::bucket::Bucket>,
-        runtime: Option<String>,
-        dns: Vec<String>,
-        data_dir: PathBuf,
     ) -> anyhow::Result<Self> {
-        // Write the resolv.conf once, to bind into every container that runs
-        // under a non-default runtime. gVisor cannot reach Docker's embedded
-        // resolver, so a bind-mounted file with a public resolver, which the
-        // fence permits, is the only resolv.conf the container can use.
-        let resolvers: Vec<String> = if dns.is_empty() {
-            DEFAULT_CONTAINER_DNS
-                .iter()
-                .map(|r| r.to_string())
-                .collect()
-        } else {
-            dns.clone()
-        };
-        let resolv_conf = {
-            let path = data_dir.join("container-resolv.conf");
-            let body: String = resolvers
-                .iter()
-                .map(|resolver| format!("nameserver {resolver}\n"))
-                .collect();
-            let fs = asyncrt::fs();
-            match fs
-                .create_dir_all(&data_dir)
-                .and_then(|()| fs.write(&path, body.as_bytes()))
-            {
-                Ok(()) => Some(path),
-                Err(error) => {
-                    tracing::warn!(event = "container_resolv_write_failed", %error);
-                    None
-                }
-            }
-        };
-        let engine = Self {
-            docker,
+        backend.reap(&node).await?;
+        Ok(Self {
+            backend,
             node,
             bucket,
-            runtime,
-            dns,
-            resolv_conf,
             images: Mutex::new(HashMap::new()),
             cells: Mutex::new(HashMap::new()),
-            networks: tokio::sync::Mutex::new(None),
-            fenced: tokio::sync::Mutex::new(false),
-        };
-        engine.reap().await?;
-        Ok(engine)
+        })
     }
 
-    pub fn socket(&self) -> &std::path::Path {
-        self.docker.socket()
-    }
-
-    async fn reap(&self) -> anyhow::Result<()> {
-        let filters = json!({ "label": [format!("celld.node={}", self.node)] }).to_string();
-        let reply = self
-            .docker
-            .expect(
-                "GET",
-                &format!(
-                    "/containers/json?all=true&filters={}",
-                    percent_encoding::utf8_percent_encode(
-                        &filters,
-                        percent_encoding::NON_ALPHANUMERIC
-                    )
-                ),
-                None,
-                "list containers",
-            )
-            .await?;
-        let list = reply.json()?;
-        for entry in list.as_array().into_iter().flatten() {
-            if let Some(id) = entry.get("Id").and_then(Value::as_str) {
-                let _ = self
-                    .docker
-                    .call("DELETE", &format!("/containers/{id}?force=true"), None)
-                    .await;
-            }
-        }
-        Ok(())
-    }
-
-    /// Make the class's image present in the engine, loading it from the
-    /// bucket when it is not. Idempotent and serialized per image.
+    /// Make an image present in the engine, loading it from the bucket when
+    /// it is not. Idempotent and serialized per image.
     pub async fn ensure_image(&self, image: &str) -> anyhow::Result<()> {
         let lock = self
             .images
@@ -561,11 +745,7 @@ impl ContainerEngine {
         if *loaded {
             return Ok(());
         }
-        let reply = self
-            .docker
-            .call("GET", &format!("/images/{image}/json"), None)
-            .await?;
-        if reply.status.is_success() {
+        if self.backend.has_image(image).await? {
             tracing::info!(image, "container image present in the engine");
             *loaded = true;
             return Ok(());
@@ -579,207 +759,10 @@ impl ContainerEngine {
             anyhow!("image {image} is not in the bucket at {key}; run `celld deploy`")
         })?;
         let bytes = tar.len();
-        let reply = self
-            .docker
-            .post_octets("/images/load?quiet=true", tar, "load image")
-            .await?;
-        tracing::info!(
-            image,
-            bytes,
-            answer = %String::from_utf8_lossy(&reply.body).trim_end(),
-            "container image loaded from the bucket"
-        );
+        self.backend.load_image(image, tar).await?;
+        tracing::info!(image, bytes, "container image loaded from the bucket");
         *loaded = true;
         Ok(())
-    }
-
-    /// The two bridges every container joins: one with egress, one
-    /// without. Docker implements an internal network by omitting the
-    /// masquerade rule and the default route; the node still reaches the
-    /// bridge address, which is all ingress needs.
-    async fn networks(&self) -> anyhow::Result<(String, String)> {
-        let mut guard = self.networks.lock().await;
-        if let Some(names) = guard.as_ref() {
-            return Ok(names.clone());
-        }
-        for (name, internal) in [("celld", false), ("celld-internal", true)] {
-            // A bridge keeps the options it was created with, so one from
-            // before containers were isolated from each other is replaced.
-            // The replacement fails while a container is attached, which a
-            // node start after its reap never has; a failure keeps the old
-            // bridge and says so rather than refusing every container.
-            let current = self
-                .docker
-                .call("GET", &format!("/networks/{name}"), None)
-                .await?;
-            if current.status.is_success() {
-                let bridge = if internal {
-                    INTERNAL_BRIDGE
-                } else {
-                    OPEN_BRIDGE
-                };
-                let current_options = current
-                    .json()
-                    .ok()
-                    .and_then(|network| network.get("Options").cloned())
-                    .unwrap_or(Value::Null);
-                let option = |key: &str| current_options.get(key).and_then(Value::as_str);
-                if option(ICC_OPTION) == Some("false") && option(BRIDGE_NAME_OPTION) == Some(bridge)
-                {
-                    continue;
-                }
-                let removed = self
-                    .docker
-                    .call("DELETE", &format!("/networks/{name}"), None)
-                    .await?;
-                if !removed.status.is_success() {
-                    tracing::warn!(
-                        network = name,
-                        error = %removed.message(),
-                        "the container bridge predates container isolation and is in use; \
-                         containers on it can reach each other until the node restarts idle"
-                    );
-                    continue;
-                }
-            }
-            let reply = self
-                .docker
-                .call(
-                    "POST",
-                    "/networks/create",
-                    Some(json!({
-                        "Name": name,
-                        "Driver": "bridge",
-                        "Internal": internal,
-                        "Options": {
-                            ICC_OPTION: "false",
-                            BRIDGE_NAME_OPTION: if internal { INTERNAL_BRIDGE } else { OPEN_BRIDGE },
-                        },
-                    })),
-                )
-                .await?;
-            // 409: it exists, which is the steady state.
-            if !reply.status.is_success() && reply.status.as_u16() != 409 {
-                return Err(anyhow!(
-                    "create network {name} failed with [{}] {}",
-                    reply.status.as_u16(),
-                    reply.message()
-                ));
-            }
-        }
-        let names = ("celld".to_string(), "celld-internal".to_string());
-        *guard = Some(names.clone());
-        Ok(names)
-    }
-
-    /// Install the fence on the node's bridges, once per process. Every
-    /// container start waits on this and fails when it fails: a node that
-    /// cannot fence its bridges runs no container, because an unfenced
-    /// container can reach the node's internal listener and the cloud's
-    /// metadata service. The rules live in the kernel and outlive this
-    /// process; a restart re-applies them, which is idempotent.
-    pub async fn ensure_fence(&self) -> anyhow::Result<()> {
-        let mut fenced = self.fenced.lock().await;
-        if *fenced {
-            return Ok(());
-        }
-        let image = FENCE_IMAGE.read().unwrap().clone().ok_or_else(|| {
-            anyhow!(
-                "this deployment has no fence image; deploy it again with this celld, which \
-                 saves the celld-fence image beside the container images"
-            )
-        })?;
-        self.ensure_image(&image).await?;
-        self.networks().await?;
-        let body = json!({
-            "Image": image,
-            "Env": [format!("CELLD_NFT={FENCE_RULES}")],
-            "Cmd": ["sh", "-c", "printf '%s' \"$CELLD_NFT\" | nft -f -"],
-            "Labels": { "celld.node": self.node, "celld.fence": "1" },
-            "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
-        });
-        let created = self
-            .docker
-            .expect(
-                "POST",
-                "/containers/create",
-                Some(body),
-                "create fence container",
-            )
-            .await?
-            .json()?;
-        let id = created
-            .get("Id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("create fence container answered without an id"))?
-            .to_string();
-        let outcome = async {
-            self.docker
-                .expect(
-                    "POST",
-                    &format!("/containers/{id}/start"),
-                    None,
-                    "start fence container",
-                )
-                .await?;
-            let waited = self
-                .docker
-                .expect(
-                    "POST",
-                    &format!("/containers/{id}/wait"),
-                    None,
-                    "wait fence container",
-                )
-                .await?
-                .json()?;
-            let code = waited
-                .get("StatusCode")
-                .and_then(Value::as_i64)
-                .unwrap_or(-1);
-            if code != 0 {
-                let logs = self.logs(&id).await.unwrap_or_default();
-                return Err(anyhow!(
-                    "the fence container exited with {code}: {}",
-                    logs.trim()
-                ));
-            }
-            Ok(())
-        }
-        .await;
-        let _ = self
-            .docker
-            .call("DELETE", &format!("/containers/{id}?force=true"), None)
-            .await;
-        outcome.context("fence the container bridges")?;
-        tracing::info!(
-            event = "container_bridges_fenced",
-            bridges = format!("{OPEN_BRIDGE},{INTERNAL_BRIDGE}"),
-            "containers can reach the Internet and nothing of the node's own"
-        );
-        *fenced = true;
-        Ok(())
-    }
-
-    /// Both output streams of a stopped container, for an error message.
-    async fn logs(&self, id: &str) -> anyhow::Result<String> {
-        let reply = self
-            .docker
-            .expect(
-                "GET",
-                &format!("/containers/{id}/logs?stdout=true&stderr=true"),
-                None,
-                "container logs",
-            )
-            .await?;
-        let mut text = Vec::new();
-        let mut rest: &[u8] = &reply.body;
-        while rest.len() >= 8 {
-            let (_, length) = frame_header(rest[..8].try_into().unwrap());
-            let end = (8 + length).min(rest.len());
-            text.extend_from_slice(&rest[8..end]);
-            rest = &rest[end..];
-        }
-        Ok(String::from_utf8_lossy(&text).into_owned())
     }
 
     /// The cell's container handle, adopting a container a previous
@@ -800,10 +783,12 @@ impl ContainerEngine {
                 })
             });
             // A returning cell cancels the destroy its eviction armed.
-            cell.state.lock().unwrap().sweeper = None;
+            if let Some(sweeper) = cell.state.lock().unwrap().sweeper.take() {
+                sweeper.abort();
+            }
             cell.clone()
         };
-        let running = self.inspect_running(&cell).await?;
+        let running = self.backend.running(&cell.name).await?;
         // A container this handle did not start, left running by an
         // earlier owner of the name: give it a run so `monitor()` has an
         // exit to wait for. The run opens before the address lands, because
@@ -811,6 +796,7 @@ impl ContainerEngine {
         let adopted = running.is_some() && !cell.running();
         if adopted {
             let run = cell.begin_run();
+            cell.state.lock().unwrap().info.started = true;
             self.watch_exit(&cell, run);
         }
         let mut state = cell.state.lock().unwrap();
@@ -825,8 +811,25 @@ impl ContainerEngine {
         self.cells.lock().unwrap().get(scope).cloned()
     }
 
+    /// The cell whose container has this name.
+    pub(crate) fn cell_named(&self, name: &str) -> Option<Arc<CellContainer>> {
+        self.cells
+            .lock()
+            .unwrap()
+            .values()
+            .find(|cell| cell.name == name)
+            .cloned()
+    }
+
+    /// The route of the intercept a container's engine named by index.
+    pub(crate) fn intercept_route(&self, name: &str, index: usize) -> Option<ServiceRoute> {
+        let cell = self.cell_named(name)?;
+        let state = cell.state.lock().unwrap();
+        state.intercepts.get(index).map(|i| i.route.clone())
+    }
+
     /// The memory the node's running containers reserve, summed over their
-    /// instance-type caps. A cell whose container is not running reserves
+    /// instance caps. A cell whose container is not running reserves
     /// nothing: a stopped container holds no memory, and an idle eviction
     /// stops it before the sample would count it.
     pub fn reserved_memory_bytes(&self) -> u64 {
@@ -834,8 +837,13 @@ impl ContainerEngine {
             .lock()
             .unwrap()
             .values()
-            .filter(|cell| cell.running())
-            .map(|cell| instance_memory_bytes(cell.spec.instance_type.as_deref()))
+            .filter_map(|cell| {
+                let state = cell.state.lock().unwrap();
+                state.running.then(|| match state.info.memory_bytes {
+                    0 => instance_memory_bytes(cell.spec.instance_type.as_deref()),
+                    bytes => bytes,
+                })
+            })
             .sum()
     }
 
@@ -885,32 +893,6 @@ impl ContainerEngine {
         Ok(())
     }
 
-    async fn inspect_running(&self, cell: &CellContainer) -> anyhow::Result<Option<Address>> {
-        let reply = self
-            .docker
-            .call("GET", &format!("/containers/{}/json", cell.name), None)
-            .await?;
-        if reply.status.as_u16() == 404 {
-            return Ok(None);
-        }
-        if !reply.status.is_success() {
-            return Err(anyhow!(
-                "inspect container failed with [{}] {}",
-                reply.status.as_u16(),
-                reply.message()
-            ));
-        }
-        let info = reply.json()?;
-        let running = info
-            .pointer("/State/Running")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        Ok(running.then(|| address_of(&info)))
-    }
-
-    /// Start the cell's container. The object's `start()` returns before
-    /// this completes, as on Cloudflare; a failure surfaces through
-    /// `monitor()`.
     /// Start the cell's container for the run `begin_run` opened. The
     /// object's `start()` returns before this completes, as on Cloudflare;
     /// a failure surfaces through `monitor()`.
@@ -931,6 +913,7 @@ impl ContainerEngine {
                 tracing::warn!(
                     event = "container_start_failed",
                     cell = %cell.scope,
+                    engine = self.backend.kind(),
                     error = %format!("{error:#}"),
                     "the container did not start"
                 );
@@ -942,10 +925,29 @@ impl ContainerEngine {
                 return Err(error);
             }
         };
-        {
+        // `destroy()` may have come while the start was under way (`start()`
+        // returns at once, and its object can destroy at once): what the
+        // start made goes too, and the run ends destroyed.
+        let destroyed = {
             let mut state = cell.state.lock().unwrap();
-            state.running = true;
-            state.address = address;
+            let destroyed = state.destroyed == Some(run) || state.run != run;
+            if !destroyed {
+                state.running = true;
+                state.address = address;
+                state.info.started = true;
+            }
+            destroyed
+        };
+        if destroyed {
+            self.backend.remove(&cell.name).await;
+            cell.exit.send_replace(Some((
+                run,
+                Ok(RunExit {
+                    code: 137,
+                    destroyed: true,
+                }),
+            )));
+            return Ok(());
         }
         self.watch_exit(cell, run);
         Ok(())
@@ -954,33 +956,26 @@ impl ContainerEngine {
     /// Wait for the container's root process to end and publish the exit
     /// for `run`; a later run's start has already replaced the state.
     fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64) {
-        let docker = self.docker.clone();
+        let backend = self.backend.clone();
         let cell_ = cell.clone();
         asyncrt::spawn(async move {
-            let result = docker
-                .call("POST", &format!("/containers/{}/wait", cell_.name), None)
+            let result = backend
+                .wait(&cell_.name)
                 .await
-                .and_then(|reply| {
-                    if !reply.status.is_success() {
-                        return Err(anyhow!(
-                            "wait failed with [{}] {}",
-                            reply.status.as_u16(),
-                            reply.message()
-                        ));
-                    }
-                    reply
-                        .json()?
-                        .get("StatusCode")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| anyhow!("wait answered without a status code"))
-                })
                 .map_err(|error| format!("{error:#}"));
             let mut state = cell_.state.lock().unwrap();
+            let destroyed = state.destroyed == Some(run);
             if state.run == run {
                 state.running = false;
-                state.address = Address::None;
+                if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
+                    forwarder.close();
+                }
             }
             drop(state);
+            let result = result.map(|exit| RunExit {
+                code: exit.code,
+                destroyed: exit.destroyed || destroyed,
+            });
             cell_.exit.send_replace(Some((run, result)));
         })
         .detach();
@@ -991,21 +986,47 @@ impl ContainerEngine {
         cell: &CellContainer,
         params: StartParams,
     ) -> anyhow::Result<Address> {
-        self.ensure_fence().await?;
+        self.backend.prepare().await?;
         self.enforce_instance_ceiling(cell).await?;
-        self.ensure_image(&cell.spec.image).await?;
-        let (open, internal) = self.networks().await?;
-        // A previous run's container may still be named: the wait task
-        // observed its exit but nothing removed it, or a restart adopted a
-        // stopped one. The name is the cell's, so it is ours to remove.
-        let _ = self
-            .docker
-            .call(
-                "DELETE",
-                &format!("/containers/{}?force=true", cell.name),
-                None,
+        let spec = &cell.spec;
+        let image = match (&params.image, &params.snapshot) {
+            (Some(_), Some(_)) => {
+                return Err(anyhow!("start(): pass an image or a containerSnapshot, not both"))
+            }
+            (Some(image), None) => {
+                if !spec.all_images().any(|known| known == image) {
+                    return Err(anyhow!(
+                        "start(): the image must be one of ctx.container.images or the class's image"
+                    ));
+                }
+                Some(image.clone())
+            }
+            (None, Some(_)) => {
+                if !self.backend.restores_snapshots() {
+                    return Err(anyhow!(
+                        "start(): containerSnapshot is not supported by celld's {} engine",
+                        self.backend.kind()
+                    ));
+                }
+                None
+            }
+            (None, None) => Some(spec.image.clone().ok_or_else(|| {
+                anyhow!("start(): this class has the durable_object scheduling policy; pass an image")
+            })?),
+        };
+        if let Some(image) = &image {
+            self.ensure_image(image).await?;
+        }
+        let instance = params.instance.clone().unwrap_or_else(|| {
+            Instance::Named(
+                spec.instance_type
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string()),
             )
-            .await;
+        });
+        let (_, memory_bytes) = instance
+            .resources()
+            .ok_or_else(|| anyhow!("start(): {instance:?} is not an instance type"))?;
         let mut env: Vec<String> = DEFAULT_ENV.iter().map(|entry| entry.to_string()).collect();
         env.push(format!("CLOUDFLARE_DURABLE_OBJECT_ID={}", cell.scope));
         env.extend(
@@ -1014,155 +1035,43 @@ impl ContainerEngine {
                 .iter()
                 .map(|(name, value)| format!("{name}={value}")),
         );
-        let mut labels = serde_json::Map::new();
-        labels.insert("celld.node".into(), json!(self.node));
-        labels.insert("celld.cell".into(), json!(cell.scope));
-        labels.insert("celld.class".into(), json!(cell.spec.class_name));
-        for (name, value) in &params.labels {
-            labels.insert(format!("celld.user.{name}"), json!(value));
-        }
-        // Off Linux the node reaches a container only through published
-        // ports, and Docker publishes nothing on an internal network, so
-        // `enableInternet: false` would make the container unreachable.
-        // Development there keeps egress; the compat page says so.
-        let offline = !params.enable_internet && cfg!(target_os = "linux");
-        if !params.enable_internet && !offline {
-            tracing::warn!(
-                cell = %cell.scope,
-                "enableInternet: false is not enforced on this platform; the container keeps egress"
-            );
-        }
-        // A container is a tenant's process tree, not the operator's: no
-        // capability, no privilege gain through setuid binaries, the
-        // daemon's seccomp profile, and a process ceiling. What a class
-        // legitimately needs beyond this is a config question for later,
-        // not a default. The kernel boundary itself is the runtime's.
-        let mut host_config = json!({
-            "NetworkMode": if offline { &internal } else { &open },
-            "PublishAllPorts": !cfg!(target_os = "linux"),
-            "CapDrop": ["ALL"],
-            "SecurityOpt": ["no-new-privileges"],
-            "PidsLimit": PIDS_LIMIT,
-            // An init as PID 1 reaps orphaned children. Without it a process
-            // whose parent exits becomes a zombie the container holds until
-            // it stops, and enough of them exhaust the PID ceiling; a fleet
-            // fork bomb left exactly these behind.
-            "Init": true,
-        });
-        // A class can name its own runtime, else the node default. A class
-        // that needs isolation names `runsc`, and the node's daemon must
-        // have it or the start fails, so the class runs only where its
-        // isolation is real.
-        let runtime = cell
-            .spec
-            .runtime
-            .as_deref()
-            .or(self.runtime.as_deref())
-            .filter(|runtime| !runtime.is_empty());
-        if let Some(runtime) = runtime {
-            host_config["Runtime"] = json!(runtime);
-        }
-        // A container under a non-default runtime gets an explicit resolver
-        // through a bind-mounted resolv.conf: gVisor cannot reach Docker's
-        // embedded resolver at `127.0.0.11`, and on a user bridge Docker
-        // keeps that address in resolv.conf whatever `--dns` says, so the
-        // file itself must name a reachable resolver. An operator who set
-        // `CELLD_CONTAINER_DNS` gets it for every container.
-        let wants_resolver = runtime.is_some() || !self.dns.is_empty();
-        if wants_resolver {
-            if let Some(resolv) = &self.resolv_conf {
-                let bind = format!("{}:/etc/resolv.conf:ro", resolv.display());
-                host_config["Binds"] = json!([bind]);
-            }
-        }
-        // Every container has a limit: a class without an instance type
-        // gets Cloudflare's default type rather than the node.
-        let instance_type = cell
-            .spec
-            .instance_type
-            .as_deref()
-            .unwrap_or(DEFAULT_INSTANCE_TYPE);
-        let (vcpu, memory) =
-            instance_resources(instance_type).expect("the deploy refused this instance type");
-        host_config["NanoCpus"] = json!((vcpu * 1e9) as u64);
-        host_config["Memory"] = json!(memory);
-        host_config["MemorySwap"] = json!(memory);
-        let mut body = json!({
-            "Image": cell.spec.image,
-            "Env": env,
-            "Labels": labels,
-            "HostConfig": host_config,
-        });
-        if let Some(entrypoint) = params.entrypoint {
-            body["Cmd"] = json!(entrypoint);
-        }
-        // The daemon can answer 409 for a name whose previous container is
-        // still being removed, so a fresh start after `destroy()` retries
-        // briefly, as workerd's engine does.
-        let mut reply = self
-            .docker
-            .call(
-                "POST",
-                &format!("/containers/create?name={}", cell.name),
-                Some(body.clone()),
+        let intercepts = {
+            let mut state = cell.state.lock().unwrap();
+            state.info = RunInfo {
+                image: image.clone().unwrap_or_default(),
+                labels: params.labels.iter().cloned().collect(),
+                from_snapshot: params.snapshot.is_some(),
+                started: false,
+                memory_bytes,
+            };
+            state.intercepts.iter().map(|i| i.rule.clone()).collect()
+        };
+        // A container under a non-default runtime is Docker's matter; the
+        // class names one, else the node default.
+        let runtime = spec.runtime.clone();
+        self.backend
+            .create_and_start(
+                &cell.name,
+                Launch {
+                    scope: cell.scope.clone(),
+                    node: self.node.clone(),
+                    class: spec.class_name.clone(),
+                    image,
+                    snapshot: params.snapshot,
+                    env,
+                    labels: params.labels,
+                    entrypoint: params.entrypoint,
+                    enable_internet: params.enable_internet,
+                    instance,
+                    runtime,
+                    intercepts,
+                },
             )
-            .await?;
-        for _ in 0..20 {
-            if reply.status.as_u16() != 409 {
-                break;
-            }
-            asyncrt::sleep(Duration::from_millis(100)).await;
-            let _ = self
-                .docker
-                .call(
-                    "DELETE",
-                    &format!("/containers/{}?force=true", cell.name),
-                    None,
-                )
-                .await;
-            reply = self
-                .docker
-                .call(
-                    "POST",
-                    &format!("/containers/create?name={}", cell.name),
-                    Some(body.clone()),
-                )
-                .await?;
-        }
-        if reply.status.as_u16() == 404 {
-            return Err(anyhow!("No such image available named {}", cell.spec.image));
-        }
-        if !reply.status.is_success() {
-            return Err(anyhow!(
-                "Create container failed with [{}] {}",
-                reply.status.as_u16(),
-                reply.message()
-            ));
-        }
-        self.docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/start", cell.name),
-                None,
-                "start container",
-            )
-            .await?;
-        let info = self
-            .docker
-            .expect(
-                "GET",
-                &format!("/containers/{}/json", cell.name),
-                None,
-                "inspect container",
-            )
-            .await?
-            .json()?;
-        Ok(address_of(&info))
+            .await
     }
 
-    /// Wait for the current run to end. `Ok(code)` is the root process's
-    /// exit code; a destroyed container reports 137.
-    pub async fn monitor(&self, cell: &Arc<CellContainer>, run: u64) -> Result<i64, String> {
+    /// Wait for the current run to end.
+    pub async fn monitor(&self, cell: &Arc<CellContainer>, run: u64) -> Result<RunExit, String> {
         let mut receiver = cell.exit.subscribe();
         loop {
             if let Some((ended, result)) = receiver.borrow_and_update().clone() {
@@ -1177,39 +1086,60 @@ impl ContainerEngine {
     }
 
     pub async fn destroy(&self, cell: &Arc<CellContainer>) -> anyhow::Result<()> {
-        // Kill first so the wait task reports 137 before the removal makes
-        // the name disappear under it.
-        let _ = self
-            .docker
-            .call(
-                "POST",
-                &format!("/containers/{}/kill?signal=SIGKILL", cell.name),
-                None,
-            )
-            .await;
-        let _ = self
-            .docker
-            .call(
-                "DELETE",
-                &format!("/containers/{}?force=true", cell.name),
-                None,
-            )
-            .await;
+        {
+            let mut state = cell.state.lock().unwrap();
+            state.destroyed = Some(state.run);
+        }
+        self.backend.remove(&cell.name).await;
         let mut state = cell.state.lock().unwrap();
         state.running = false;
-        state.address = Address::None;
+        if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
+            forwarder.close();
+        }
         Ok(())
     }
 
     pub async fn signal(&self, cell: &Arc<CellContainer>, signal: u32) -> anyhow::Result<()> {
-        self.docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/kill?signal={signal}", cell.name),
-                None,
-                "signal container",
-            )
-            .await?;
+        self.backend.signal(&cell.name, signal).await
+    }
+
+    /// `snapshotContainer({name})`.
+    pub async fn snapshot(&self, cell: &Arc<CellContainer>, name: Option<String>) -> anyhow::Result<Value> {
+        if !cell.running() {
+            return Err(anyhow!("snapshotContainer() requires a running container."));
+        }
+        self.backend.snapshot(&cell.name, name).await
+    }
+
+    /// `interceptOutbound*`: added for the cell's container's life, and to a
+    /// running container at once. Cloudflare's count of 128 entries holds.
+    pub async fn intercept(
+        &self,
+        cell: &Arc<CellContainer>,
+        rule: InterceptRule,
+        route: ServiceRoute,
+    ) -> anyhow::Result<()> {
+        // Refused before it is recorded: a rule kept for an engine that
+        // cannot route it would refuse every later start.
+        anyhow::ensure!(
+            self.backend.intercepts(),
+            "interceptOutboundHttp() is not supported by celld's {} engine",
+            self.backend.kind()
+        );
+        let rules = {
+            let mut state = cell.state.lock().unwrap();
+            let used: usize = state.intercepts.iter().map(|i| i.rule.entries()).sum();
+            anyhow::ensure!(
+                used + rule.entries() <= INTERCEPT_ENTRIES_MAX,
+                "a container takes at most {INTERCEPT_ENTRIES_MAX} intercept entries (a hostname counts two)"
+            );
+            state.intercepts.push(Intercept { rule, route });
+            let running = state.running && state.info.started;
+            running.then(|| state.intercepts.iter().map(|i| i.rule.clone()).collect::<Vec<_>>())
+        };
+        if let Some(rules) = rules {
+            self.backend.set_intercepts(&cell.name, &rules).await?;
+        }
         Ok(())
     }
 
@@ -1236,7 +1166,9 @@ impl ContainerEngine {
                     asyncrt::sleep(window).await;
                     engine.forget(&cell_).await;
                 });
-                cell.state.lock().unwrap().sweeper = Some(sweeper);
+                if let Some(previous) = cell.state.lock().unwrap().sweeper.replace(sweeper) {
+                    previous.abort();
+                }
             }
             Release::Destroy => self.forget(&cell).await,
         }
@@ -1264,92 +1196,15 @@ impl ContainerEngine {
         if !cell.running() {
             return Err(anyhow!("exec() requires a running container."));
         }
-        let mut body = json!({
-            "AttachStdin": true,
-            "AttachStdout": true,
-            "AttachStderr": true,
-            "Tty": false,
-            "Cmd": params.cmd,
-        });
-        if !params.env.is_empty() {
-            body["Env"] = json!(params
-                .env
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>());
-        }
-        if let Some(cwd) = &params.cwd {
-            body["WorkingDir"] = json!(cwd);
-        }
-        if let Some(user) = &params.user {
-            body["User"] = json!(user);
-        }
-        let created = self
-            .docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/exec", cell.name),
-                Some(body),
-                "create exec",
-            )
-            .await?
-            .json()?;
-        let exec_id = created
-            .get("Id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("exec create answered without an id"))?
-            .to_string();
-        let stream = self
-            .docker
-            .hijack(
-                &format!("/exec/{exec_id}/start"),
-                json!({ "Detach": false, "Tty": false }),
-            )
-            .await?;
-        // Docker reports `Running: false` with no pid before it has spawned
-        // the process, and a finished exec keeps its pid, so a pid of zero
-        // is the one answer that means "not yet": retry it briefly, as
-        // workerd does. Breaking on `Running: false` here lost the pid of a
-        // short command whenever the inspect landed in that window.
-        let mut pid = 0;
-        for _ in 0..20 {
-            let info = self
-                .docker
-                .expect(
-                    "GET",
-                    &format!("/exec/{exec_id}/json"),
-                    None,
-                    "inspect exec",
-                )
-                .await?
-                .json()?;
-            pid = info.get("Pid").and_then(Value::as_i64).unwrap_or(0);
-            if pid != 0 {
-                break;
-            }
-            asyncrt::sleep(Duration::from_millis(50)).await;
-        }
-        let (read, write) = tokio::io::split(stream);
-        let (stdout_tx, stdout_rx) = mpsc::channel(16);
-        let (stderr_tx, stderr_rx) = mpsc::channel(16);
-        let combined = params.combined;
-        let ended = watch::channel(false).0;
-        let ended_ = ended.clone();
-        asyncrt::spawn(async move {
-            demux(read, stdout_tx, stderr_tx, combined).await;
-            ended_.send_replace(true);
-        })
-        .detach();
+        let pty = params.pty.is_some();
+        let started = self.backend.exec(&cell.name, &params).await?;
         let process = Arc::new(ExecProcess {
             id: next_exec_id(),
-            exec_id,
-            container: cell.name.clone(),
-            pid,
-            docker: self.docker.clone(),
-            stdin: tokio::sync::Mutex::new(Some(write)),
-            stdout: tokio::sync::Mutex::new(stdout_rx),
-            stderr: tokio::sync::Mutex::new(stderr_rx),
-            ended,
+            pid: started.pid,
+            pty,
+            io: started.io,
+            stdout: tokio::sync::Mutex::new(started.stdout),
+            stderr: tokio::sync::Mutex::new(started.stderr),
             exit_code: tokio::sync::Mutex::new(None),
         });
         processes()
@@ -1361,29 +1216,54 @@ impl ContainerEngine {
     }
 }
 
+/// Where an exec's output goes, as `exec()`'s options say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMode {
+    Pipe,
+    Ignore,
+    /// stderr only: folded into stdout.
+    Combined,
+}
+
 pub struct ExecParams {
     pub cmd: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<String>,
     pub user: Option<String>,
-    /// stderr folded into stdout.
-    pub combined: bool,
+    pub stdin: bool,
+    pub stdout: OutputMode,
+    pub stderr: OutputMode,
+    /// A pseudo-terminal of `(cols, rows)`.
+    pub pty: Option<(u16, u16)>,
 }
 
-type WriteHalf = tokio::io::WriteHalf<Box<dyn Stream>>;
+/// An exec's running half, the engine's: its input, its end, its signals.
+#[async_trait::async_trait]
+pub(crate) trait ExecIo: Send + Sync {
+    async fn write(&self, bytes: &[u8]) -> Result<(), String>;
+    async fn close_stdin(&self);
+    /// The exit code (128 + n for a signal).
+    async fn wait(&self) -> anyhow::Result<i64>;
+    async fn kill(&self, signal: u32) -> anyhow::Result<()>;
+    async fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()>;
+}
+
+/// What a backend's `exec` returns once the process has started.
+pub(crate) struct ExecStarted {
+    pub pid: i64,
+    pub io: Box<dyn ExecIo>,
+    pub stdout: mpsc::Receiver<Bytes>,
+    pub stderr: mpsc::Receiver<Bytes>,
+}
 
 pub struct ExecProcess {
     pub id: u64,
-    exec_id: String,
-    container: String,
     pub pid: i64,
-    docker: Docker,
-    stdin: tokio::sync::Mutex<Option<WriteHalf>>,
+    pub pty: bool,
+    io: Box<dyn ExecIo>,
     stdout: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     stderr: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
-    /// True once the hijacked stream reached EOF, which the daemon sends
-    /// when the process exits.
-    ended: watch::Sender<bool>,
     exit_code: tokio::sync::Mutex<Option<i64>>,
 }
 
@@ -1416,24 +1296,11 @@ impl ExecProcess {
     }
 
     pub async fn write(&self, bytes: &[u8]) -> Result<(), String> {
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard.as_mut().ok_or("stdin is closed")?;
-        stdin
-            .write_all(bytes)
-            .await
-            .map_err(|error| format!("stdin write failed: {error}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|error| format!("stdin flush failed: {error}"))
+        self.io.write(bytes).await
     }
 
-    /// End stdin. Half-closing the hijacked connection is how the daemon
-    /// learns the process's stdin reached EOF.
     pub async fn close_stdin(&self) {
-        if let Some(mut stdin) = self.stdin.lock().await.take() {
-            let _ = stdin.shutdown().await;
-        }
+        self.io.close_stdin().await;
     }
 
     pub async fn wait(&self) -> anyhow::Result<i64> {
@@ -1441,148 +1308,87 @@ impl ExecProcess {
         if let Some(code) = *exit {
             return Ok(code);
         }
-        let mut ended = self.ended.subscribe();
-        while !*ended.borrow_and_update() {
-            if ended.changed().await.is_err() {
-                break;
-            }
-        }
-        // The stream closes when the process exits, but the daemon records
-        // the exit code a moment later.
-        let mut code = None;
-        for _ in 0..40 {
-            let info = self
-                .docker
-                .expect(
-                    "GET",
-                    &format!("/exec/{}/json", self.exec_id),
-                    None,
-                    "inspect exec",
-                )
-                .await?
-                .json()?;
-            if !info
-                .get("Running")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                code = info.get("ExitCode").and_then(Value::as_i64);
-                break;
-            }
-            asyncrt::sleep(Duration::from_millis(50)).await;
-        }
-        let code = code.ok_or_else(|| anyhow!("the process did not report an exit code"))?;
+        let code = self.io.wait().await?;
         *exit = Some(code);
         Ok(code)
     }
 
-    /// The Engine API has no exec kill, so the signal is delivered by a
-    /// second exec of `kill`, as workerd does.
     pub async fn kill(&self, signal: u32) -> anyhow::Result<()> {
-        let body = json!({
-            "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
-            "Cmd": ["kill", format!("-{signal}"), self.pid.to_string()],
-        });
-        let created = self
-            .docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/exec", self.container),
-                Some(body),
-                "create exec",
-            )
-            .await?
-            .json()?;
-        let id = created
-            .get("Id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("exec create answered without an id"))?;
-        self.docker
-            .expect(
-                "POST",
-                &format!("/exec/{id}/start"),
-                Some(json!({ "Detach": true })),
-                "start exec",
-            )
-            .await?;
-        Ok(())
+        self.io.kill(signal).await
+    }
+
+    pub async fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        if !self.pty {
+            return Err(anyhow!("resize() requires a process started with pty"));
+        }
+        self.io.resize(cols, rows).await
     }
 }
 
-/// Split Docker's multiplexed stream into stdout and stderr chunks until
-/// the daemon closes it.
-async fn demux(
-    mut read: tokio::io::ReadHalf<Box<dyn Stream>>,
-    stdout: mpsc::Sender<Bytes>,
-    stderr: mpsc::Sender<Bytes>,
-    combined: bool,
-) {
-    let mut header = [0u8; 8];
-    loop {
-        if read.read_exact(&mut header).await.is_err() {
-            return;
-        }
-        let (stream, length) = frame_header(&header);
-        let mut payload = vec![0u8; length];
-        if read.read_exact(&mut payload).await.is_err() {
-            return;
-        }
-        let target = if stream == 2 && !combined {
-            &stderr
-        } else {
-            &stdout
-        };
-        if target.send(Bytes::from(payload)).await.is_err() {
-            // The reader went away; keep draining so the process is not
-            // blocked on a full pipe.
-            continue;
-        }
-    }
-}
-
-fn address_of(info: &Value) -> Address {
-    if cfg!(target_os = "linux") {
-        let ip = info
-            .pointer("/NetworkSettings/Networks")
-            .and_then(Value::as_object)
-            .and_then(|networks| networks.values().next())
-            .and_then(|network| network.get("IPAddress"))
-            .and_then(Value::as_str)
-            .filter(|ip| !ip.is_empty());
-        return ip.map_or(Address::None, |ip| Address::Ip(ip.to_string()));
-    }
-    let mut ports = HashMap::new();
-    if let Some(map) = info
-        .pointer("/NetworkSettings/Ports")
-        .and_then(Value::as_object)
-    {
-        for (key, bindings) in map {
-            let Some(port) = key
-                .strip_suffix("/tcp")
-                .and_then(|port| port.parse::<u16>().ok())
-            else {
-                continue;
-            };
-            let host = bindings
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find_map(|binding| binding.get("HostPort")?.as_str()?.parse::<u16>().ok());
-            if let Some(host) = host {
-                ports.insert(port, host);
-            }
-        }
-    }
-    Address::Published(ports)
-}
-
-/// A Docker name from a node and a cell scope: the scope's characters are
-/// not all legal, so the name is a hash and the scope rides in a label.
-/// The node is part of it because two nodes can share one engine in a
-/// development or test setup, and a name from the scope alone let one
-/// node adopt, or reap, the other's container for the same object.
-fn container_name(node: &str, scope: &str) -> String {
+/// A container name from a node and a cell scope: the scope's characters
+/// are not all legal, so the name is a hash and the scope rides in a label
+/// (Docker) or in celld's map (krun). The node is part of it because two
+/// nodes can share one engine in a development or test setup, and a name
+/// from the scope alone let one node adopt, or reap, the other's container
+/// for the same object; its own tag up front lets a node reap its own by
+/// prefix.
+pub(crate) fn container_name(node: &str, scope: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
-    format!("celld-{:x}", digest)[..30].to_string()
+    format!("{}{:x}", node_prefix(node), digest)[..30].to_string()
+}
+
+/// The start of every container name of `node`.
+pub(crate) fn node_prefix(node: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(node.as_bytes());
+    format!("celld-{}-", &format!("{digest:x}")[..6])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_carry_their_node() {
+        let a = container_name("node-a", "Box:1");
+        assert_eq!(a.len(), 30);
+        assert!(a.starts_with(&node_prefix("node-a")));
+        assert!(!a.starts_with(&node_prefix("node-b")));
+        assert_ne!(a, container_name("node-a", "Box:2"));
+    }
+
+    #[test]
+    fn intercept_entries_count_as_cloudflare_counts() {
+        let rule = |target: &str| InterceptRule { scheme: "http", target: target.into() };
+        assert_eq!(rule("api.example.com").entries(), 2);
+        assert_eq!(rule("*.example.com").entries(), 2);
+        assert_eq!(rule("*").entries(), 2);
+        assert_eq!(rule("api.example.com:8443").entries(), 2);
+        assert_eq!(rule("15.0.0.1:80").entries(), 1);
+        assert_eq!(rule("203.0.113.0/24").entries(), 1);
+    }
+
+    #[test]
+    fn engine_choice() {
+        assert_eq!(EngineChoice::parse(None).unwrap(), EngineChoice::Docker);
+        assert_eq!(EngineChoice::parse(Some("docker")).unwrap(), EngineChoice::Docker);
+        assert_eq!(
+            EngineChoice::parse(Some("krun:/var/lib/e/engine.sock")).unwrap(),
+            EngineChoice::Krun("/var/lib/e/engine.sock".into())
+        );
+        assert!(EngineChoice::parse(Some("krun:relative.sock")).is_err());
+        assert!(EngineChoice::parse(Some("podman")).is_err());
+    }
+
+    #[test]
+    fn instances_to_the_engine() {
+        assert_eq!(Instance::Named("dev".into()).to_json(), json!("lite"));
+        assert_eq!(Instance::Named("standard".into()).to_json(), json!("standard-1"));
+        assert_eq!(
+            Instance::Custom { vcpu: 2.0, memory_mib: 6144, disk_mb: 8000 }.to_json(),
+            json!({"vcpu": 2.0, "memoryMib": 6144, "diskMb": 8000})
+        );
+        assert_eq!(Instance::Named("basic".into()).resources(), Some((0.25, 1 << 30)));
+    }
 }

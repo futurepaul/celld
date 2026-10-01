@@ -7,7 +7,10 @@
 //! `__container_exec` returned.
 
 use super::*;
-use crate::container::{self, CellContainer, ContainerEngine, ExecParams, StartParams};
+use crate::container::{
+    self, CellContainer, ContainerEngine, ExecParams, Instance, InterceptRule, OutputMode,
+    ServiceRoute, StartParams,
+};
 use std::time::Duration;
 
 async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContainer>), String> {
@@ -18,6 +21,10 @@ async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContaine
         .cell(scope)
         .ok_or_else(|| "this Durable Object has no container".to_string())?;
     Ok((engine, cell))
+}
+
+fn ready_cell(scope: &str) -> Option<Arc<CellContainer>> {
+    container::engine_if_ready().and_then(|engine| engine.cell(scope))
 }
 
 fn string_arg(
@@ -38,9 +45,7 @@ pub(super) fn op_container_running(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
-    let running = container::engine_if_ready()
-        .and_then(|engine| engine.cell(&cell))
-        .is_some_and(|cell| cell.running());
+    let running = ready_cell(&cell).is_some_and(|cell| cell.running());
     rv.set(v8::Boolean::new(scope, running).into());
 }
 
@@ -52,14 +57,53 @@ pub(super) fn op_container_address(
 ) {
     let cell = string_arg(scope, &args, 0);
     let port = number_arg(scope, &args, 1) as u16;
-    let address = container::engine_if_ready()
-        .and_then(|engine| engine.cell(&cell))
+    let address = ready_cell(&cell)
         .ok_or_else(|| "this Durable Object has no container".to_string())
         .and_then(|cell| cell.address(port));
     match address {
         Ok(address) => rv.set(v8::String::new(scope, &address).unwrap().into()),
         Err(message) => loader_throw(scope, &message),
     }
+}
+
+/// `inspect()`'s answer as JSON text, `null` when nothing runs.
+pub(super) fn op_container_inspect(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    let info = ready_cell(&cell).and_then(|cell| cell.inspect());
+    let text = info.map_or_else(|| "null".to_string(), |info| info.to_string());
+    rv.set(v8::String::new(scope, &text).unwrap().into());
+}
+
+/// `ctx.container.images` as JSON text.
+pub(super) fn op_container_images(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    let class = cell.split(':').next().unwrap_or_default();
+    let images = ready_cell(&cell)
+        .map(|cell| cell.images().clone())
+        .or_else(|| container::spec(class).map(|spec| spec.images.clone()))
+        .unwrap_or_default();
+    let text = serde_json::to_string(&images).unwrap_or_else(|_| "{}".into());
+    rv.set(v8::String::new(scope, &text).unwrap().into());
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum InstanceArg {
+    Named(String),
+    #[serde(rename_all = "camelCase")]
+    Custom {
+        vcpu: f64,
+        memory_mib: u64,
+        disk_mb: u64,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -72,6 +116,9 @@ struct StartArgs {
     enable_internet: bool,
     #[serde(default)]
     labels: Vec<(String, String)>,
+    image: Option<String>,
+    container_snapshot: Option<String>,
+    instance: Option<InstanceArg>,
 }
 
 pub(super) fn op_container_start(
@@ -87,9 +134,7 @@ pub(super) fn op_container_start(
     };
     // The run opens here, on the calling thread, so the monitor() that
     // follows this call in the same turn waits for this start's exit.
-    let run = container::engine_if_ready()
-        .and_then(|engine| engine.cell(&cell))
-        .map(|cell| cell.begin_run());
+    let run = ready_cell(&cell).map(|cell| cell.begin_run());
     let async_id = asyncrt::enqueue_io_context(async move {
         let (engine, cell) = cell_for(&cell).await?;
         let run = run.unwrap_or_else(|| cell.begin_run());
@@ -98,6 +143,20 @@ pub(super) fn op_container_start(
                 &cell,
                 run,
                 StartParams {
+                    image: request.image,
+                    snapshot: request.container_snapshot,
+                    instance: request.instance.map(|i| match i {
+                        InstanceArg::Named(name) => Instance::Named(name),
+                        InstanceArg::Custom {
+                            vcpu,
+                            memory_mib,
+                            disk_mb,
+                        } => Instance::Custom {
+                            vcpu,
+                            memory_mib,
+                            disk_mb,
+                        },
+                    }),
                     entrypoint: request.entrypoint,
                     env: request.env,
                     enable_internet: request.enable_internet,
@@ -111,24 +170,24 @@ pub(super) fn op_container_start(
     rv.set(promise_for(scope, async_id));
 }
 
-/// Resolves with the root process's exit code as text once the current
-/// run ends. Unrefed: a handler can await it, but once the handler has
-/// answered it cannot keep the event, and so the cell, alive. A drain
-/// would otherwise wait on a promise that settles only when the container
-/// exits. After the event, `running` reports the host's state.
+/// Resolves with `{"code", "destroyed"}` once the current run ends.
+/// Unrefed: a handler can await it, but once the handler has answered it
+/// cannot keep the event, and so the cell, alive. A drain would otherwise
+/// wait on a promise that settles only when the container exits. After the
+/// event, `running` reports the host's state.
 pub(super) fn op_container_monitor(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
-    let run = container::engine_if_ready()
-        .and_then(|engine| engine.cell(&cell))
-        .map_or(0, |cell| cell.current_run());
+    let run = ready_cell(&cell).map_or(0, |cell| cell.current_run());
     let async_id = asyncrt::enqueue_unrefed(async move {
         let (engine, cell) = cell_for(&cell).await?;
-        let code = engine.monitor(&cell, run).await?;
-        Ok::<String, String>(code.to_string())
+        let exit = engine.monitor(&cell, run).await?;
+        Ok::<String, String>(
+            serde_json::json!({ "code": exit.code, "destroyed": exit.destroyed }).to_string(),
+        )
     });
     rv.set(promise_for(scope, async_id));
 }
@@ -183,6 +242,74 @@ pub(super) fn op_container_inactivity(
     rv.set(promise_for(scope, async_id));
 }
 
+/// `snapshotContainer({name})`: resolves with the snapshot's JSON.
+pub(super) fn op_container_snapshot(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    let name = args.get(1);
+    let name = (!name.is_null_or_undefined()).then(|| name.to_rust_string_lossy(scope));
+    let async_id = asyncrt::enqueue(async move {
+        let (engine, cell) = cell_for(&cell).await?;
+        let snapshot = engine
+            .snapshot(&cell, name)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(snapshot.to_string())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+#[derive(serde::Deserialize)]
+struct InterceptArgs {
+    scheme: String,
+    target: String,
+    script: String,
+    entrypoint: Option<String>,
+}
+
+/// `interceptOutbound*`: the rule, and the binding's route (its props as
+/// structured-clone bytes in the third argument).
+pub(super) fn op_container_intercept(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    let raw = string_arg(scope, &args, 1);
+    let props = view_bytes(args.get(2)).unwrap_or_default();
+    let request: InterceptArgs = match serde_json::from_str(&raw) {
+        Ok(request) => request,
+        Err(error) => return loader_throw(scope, &format!("intercept: {error}")),
+    };
+    let scheme = match request.scheme.as_str() {
+        "http" => "http",
+        "https" => "https",
+        _ => return loader_throw(scope, "intercept: the scheme is http or https"),
+    };
+    let route = ServiceRoute {
+        generation: current_generation(scope),
+        script: request.script,
+        entrypoint: request.entrypoint,
+        props,
+    };
+    let rule = InterceptRule {
+        scheme,
+        target: request.target,
+    };
+    let async_id = asyncrt::enqueue(async move {
+        let (engine, cell) = cell_for(&cell).await?;
+        engine
+            .intercept(&cell, rule, route)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
 #[derive(serde::Deserialize)]
 struct ExecArgs {
     cmd: Vec<String>,
@@ -191,7 +318,11 @@ struct ExecArgs {
     cwd: Option<String>,
     user: Option<String>,
     #[serde(default)]
-    combined: bool,
+    stdin: bool,
+    stdout: OutputMode,
+    stderr: OutputMode,
+    /// `[cols, rows]`.
+    pty: Option<(u16, u16)>,
 }
 
 pub(super) fn op_container_exec(
@@ -215,7 +346,10 @@ pub(super) fn op_container_exec(
                     env: request.env,
                     cwd: request.cwd,
                     user: request.user,
-                    combined: request.combined,
+                    stdin: request.stdin,
+                    stdout: request.stdout,
+                    stderr: request.stderr,
+                    pty: request.pty,
                 },
             )
             .await
@@ -308,6 +442,24 @@ pub(super) fn op_container_exec_kill(
     let async_id = asyncrt::enqueue_unrefed(async move {
         process?
             .kill(signal)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+pub(super) fn op_container_exec_resize(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let process = process_arg(scope, &args);
+    let cols = number_arg(scope, &args, 1).min(u16::MAX as u64) as u16;
+    let rows = number_arg(scope, &args, 2).min(u16::MAX as u64) as u16;
+    let async_id = asyncrt::enqueue_unrefed(async move {
+        process?
+            .resize(cols, rows)
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())

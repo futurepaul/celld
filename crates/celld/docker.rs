@@ -1,6 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! A minimal Docker Engine API client over the daemon's unix socket.
+//! A minimal Docker Engine API client over the daemon's unix socket. The
+//! same plain HTTP/1.1 client serves the krun engine's API.
 //!
 //! One HTTP/1.1 connection per call: the daemon is local, the calls are
 //! rare (a container starts once), and a pooled client would have to be
@@ -49,6 +50,20 @@ impl Reply {
         self.json()
             .ok()
             .and_then(|value| value.get("message")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(&self.body).into_owned())
+    }
+
+    /// Docker's `message`, or the krun engine's `error`, or the raw body.
+    pub fn message_or_error(&self) -> String {
+        self.json()
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .or_else(|| value.get("error"))?
+                    .as_str()
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| String::from_utf8_lossy(&self.body).into_owned())
     }
 }
@@ -215,13 +230,25 @@ impl Docker {
         path: &str,
         body: serde_json::Value,
     ) -> anyhow::Result<Box<dyn Stream>> {
+        self.upgrade(path, body, "tcp").await
+    }
+
+    /// A POST that upgrades to `protocol` on 101: the connection becomes
+    /// the returned stream. The krun engine's exec upgrades this way too,
+    /// to `sandcastle-exec`; this client is plain HTTP/1.1 on a unix socket.
+    pub async fn upgrade(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        protocol: &str,
+    ) -> anyhow::Result<Box<dyn Stream>> {
         let request = Request::builder()
             .method("POST")
             .uri(format!("{API}{path}"))
             .header(HOST, "docker")
             .header(CONTENT_TYPE, "application/json")
             .header(CONNECTION, "Upgrade")
-            .header(UPGRADE, "tcp")
+            .header(UPGRADE, protocol)
             .body(Full::new(Bytes::from(serde_json::to_vec(&body)?)))
             .context("build Docker request")?;
         let (mut response, _sender) = self.send(request).await?;
@@ -237,7 +264,7 @@ impl Docker {
             return Err(anyhow!(
                 "exec start failed with [{}] {}",
                 status.as_u16(),
-                reply.message()
+                reply.message_or_error()
             ));
         }
         let upgraded = hyper::upgrade::on(&mut response)
