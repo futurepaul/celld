@@ -7282,7 +7282,6 @@ fn op_svc_call_impl(
         body,
         body_guard,
         headers,
-        caller: gate.cell_scope().map(str::to_string), // fork seam
         reply: tx,
     };
     let stream_service = http_stream_service();
@@ -8968,7 +8967,6 @@ fn op_fetch(
             body: body.unwrap_or_else(|| RequestBody::Bytes(Vec::new().into())),
             body_guard,
             headers,
-            caller: gate.cell_scope().map(str::to_string), // fork seam
             reply: tx,
         };
         let stream_service = http_stream_service();
