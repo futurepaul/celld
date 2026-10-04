@@ -57,6 +57,10 @@ off the private network. Set `CELLD_EGRESS_PUBLIC_ONLY=1` to refuse
 non-public destinations on all three, checked after a name is resolved; the
 connection goes to the addresses that were checked.
 
+A root in `CELLD_EXTRA_CA_FILE` can vouch for any host name that a Worker
+reaches, as a root in the bundled Mozilla store can. Add only a CA that you
+trust for all of the Workers' outbound traffic.
+
 ## Use the internal operator API
 
 The operator API is an alpha interface. A release can change its paths or

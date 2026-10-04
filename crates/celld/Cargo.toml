@@ -63,7 +63,11 @@ dsa.workspace = true
 x25519-dalek.workspace = true
 rand.workspace = true
 regex.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls", "stream", "json"] }
+# object_store turns on the native roots for every reqwest client in the
+# build. Naming them here keeps `tls_built_in_native_certs`, which a Worker's
+# clients use to leave them out (egress.rs), from resting on another crate's
+# features.
+reqwest = { workspace = true, features = ["rustls-tls", "rustls-tls-native-roots", "stream", "json"] }
 rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "serialize"] }
 sqlite-vec.workspace = true
 rustls.workspace = true
@@ -94,3 +98,4 @@ nix.workspace = true
 
 [dev-dependencies]
 lz4_flex.workspace = true
+rcgen.workspace = true
