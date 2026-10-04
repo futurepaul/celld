@@ -348,6 +348,10 @@ pub(super) fn op_ws_upgrade(
         .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
         .map(|(_, value)| value.split(',').map(|p| p.trim().to_string()).collect())
         .unwrap_or_default();
+    // The dial takes the node's egress rule, as `fetch` does: a container
+    // port of the calling object's own is reached through this form too.
+    let context = event_context(scope);
+    let egress = socket_egress(|| own_container_port(&context, &url));
     let pull = cell.is_empty().then(|| {
         let (pull_tx, pull_rx) = ws_pull_channel();
         ws_pull_register(id, pull_rx);
@@ -366,6 +370,7 @@ pub(super) fn op_ws_upgrade(
                 headers,
                 want_response: true,
                 target: None,
+                egress,
                 reply: tx,
             })
             .is_ok()
@@ -376,7 +381,7 @@ pub(super) fn op_ws_upgrade(
         }
         let open = match rx.await {
             Ok(Ok(open)) => open,
-            Ok(Err(error)) => return Err(format!("WebSocket upgrade failed: {error}")),
+            Ok(Err(error)) => return Err(socket_failure("WebSocket upgrade failed", &error)),
             Err(error) => return Err(format!("WebSocket connector dropped: {error}")),
         };
         Ok(match open.declined {
@@ -462,6 +467,9 @@ pub(super) fn op_ws_connect(
                 )
             }
         };
+    // The dial takes the node's egress rule, as `fetch` does.
+    let context = event_context(scope);
+    let egress = socket_egress(|| own_container_port(&context, &url));
     // No cell means a Worker socket: the isolate polls it, so register the
     // queue here on the JS thread and track it against the running request.
     let pull = cell.is_empty().then(|| {
@@ -482,6 +490,7 @@ pub(super) fn op_ws_connect(
                 headers: Vec::new(),
                 want_response: false,
                 target: None,
+                egress,
                 reply: tx,
             })
             .is_ok()
@@ -492,7 +501,7 @@ pub(super) fn op_ws_connect(
         }
         match rx.await {
             Ok(Ok(open)) => Ok(open.protocol.unwrap_or_default()),
-            Ok(Err(error)) => Err(format!("WebSocket connection failed: {error}")),
+            Ok(Err(error)) => Err(socket_failure("WebSocket connection failed", &error)),
             Err(error) => Err(format!("WebSocket connector dropped: {error}")),
         }
     });
@@ -548,6 +557,8 @@ pub(super) fn op_ws_bind_target(
                 headers: Vec::new(),
                 want_response: false,
                 target: Some(target),
+                // Never dialed: the socket joins one already in this process.
+                egress: crate::egress::Policy::node(),
                 reply: tx,
             })
             .is_ok()

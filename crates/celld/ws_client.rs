@@ -52,6 +52,8 @@ pub enum Error {
     /// revokes managed credentials, a stale-route header triggers a
     /// redispatch, and the isolate surfaces the whole thing to `onerror`.
     Declined(Box<Declined>),
+    /// The node's egress policy kept the destination out; nothing was dialed.
+    Refused(crate::egress::EgressRefused),
     /// No answer to read -- DNS, TCP, TLS, or a malformed handshake.
     Failed(anyhow::Error),
 }
@@ -68,6 +70,7 @@ impl std::fmt::Display for Error {
             Error::Declined(declined) => {
                 write!(f, "server refused the upgrade: {}", declined.status)
             }
+            Error::Refused(refused) => write!(f, "{refused}"),
             Error::Failed(error) => write!(f, "{error}"),
         }
     }
@@ -104,11 +107,19 @@ fn accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest.finalize())
 }
 
-/// Open a WebSocket to `url`, sending `extra` alongside the handshake headers.
+/// Open a WebSocket to `url`, sending `extra` alongside the handshake headers,
+/// and dialing under `egress`: a Worker's socket takes the node's rule
+/// (`CELLD_EGRESS_PUBLIC_ONLY`), celld's own takes `Policy::OPEN`. A non-101
+/// answer, a redirect included, is returned rather than followed, so the
+/// dial is the only connection the rule has to judge.
 ///
 /// The caller owns the timeout: nothing here bounds how long a server may take
 /// to answer.
-pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
+pub async fn connect(
+    url: &str,
+    extra: HeaderMap,
+    egress: crate::egress::Policy,
+) -> Result<Connection, Error> {
     let url = url::Url::parse(url).context("parse WebSocket URL")?;
     // `fetch("http://…", { headers: { Upgrade: "websocket" } })` is the
     // Workers idiom for an outbound socket, and the only form a container
@@ -132,9 +143,15 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
         None => url.path().to_string(),
     };
 
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("connect {authority}"))?;
+    let tcp = match egress.connect(&host, port).await {
+        Ok(tcp) => tcp,
+        Err(crate::egress::DialError::Refused(refused)) => return Err(Error::Refused(refused)),
+        Err(crate::egress::DialError::Io(error)) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("connect {authority}"))
+                .into())
+        }
+    };
     let stream: Box<dyn Stream> = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;
@@ -210,3 +227,107 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
 
 trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<S: AsyncRead + AsyncWrite + Send + Unpin> Stream for S {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::tests::LOOPBACK_IS_PUBLIC;
+    use crate::egress::Policy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A server that declines one upgrade with a 403, so a dial that lands
+    /// shows as `Declined` without a WebSocket implementation on this side.
+    async fn decline_once(listener: &TcpListener) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8];
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            request.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    }
+
+    async fn declined(url: &str, egress: Policy, listener: &TcpListener) {
+        let (result, _) = tokio::join!(
+            connect(url, HeaderMap::new(), egress),
+            decline_once(listener)
+        );
+        match result {
+            Err(Error::Declined(declined)) => assert_eq!(declined.status, StatusCode::FORBIDDEN),
+            Err(error) => panic!("{url}: expected the server's 403, got {error}"),
+            Ok(_) => panic!("{url}: expected the server's 403, got a socket"),
+        }
+    }
+
+    fn refusal(result: Result<Connection, Error>) -> String {
+        match result {
+            Err(Error::Refused(refused)) => refused.0,
+            Err(error) => panic!("expected a refusal, got {error}"),
+            Ok(_) => panic!("expected a refusal, got a socket"),
+        }
+    }
+
+    // Invalid: a public-only socket never dials a non-public literal or a
+    // name with no public address, in either spelling of the scheme.
+    #[tokio::test]
+    async fn public_only_refuses_private_destinations() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for url in [
+            format!("ws://127.0.0.1:{port}/"),
+            format!("http://127.0.0.1:{port}/chat"),
+            format!("ws://[::1]:{port}/"),
+            "wss://10.0.0.1/".to_string(),
+            "ws://169.254.169.254/latest".to_string(),
+            "https://[fdaa:0:bfe:a7b:21a:59a5:632b:2]:8081/".to_string(),
+        ] {
+            let message = refusal(connect(&url, HeaderMap::new(), Policy::PUBLIC).await);
+            assert!(message.starts_with("egress refused: "), "{url}: {message}");
+            assert!(
+                message.ends_with(" is not a public address"),
+                "{url}: {message}"
+            );
+        }
+        let url = format!("ws://localhost:{port}/");
+        let message = refusal(connect(&url, HeaderMap::new(), Policy::PUBLIC).await);
+        assert_eq!(
+            message,
+            "egress refused: localhost resolves to no public address"
+        );
+    }
+
+    // Valid: what the rule calls public is dialed, by literal and by name.
+    #[tokio::test]
+    async fn public_only_reaches_public_destinations() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        declined(
+            &format!("ws://127.0.0.1:{port}/"),
+            LOOPBACK_IS_PUBLIC,
+            &listener,
+        )
+        .await;
+        declined(
+            &format!("http://localhost:{port}/"),
+            LOOPBACK_IS_PUBLIC,
+            &listener,
+        )
+        .await;
+    }
+
+    // Off: the socket dials as it always did.
+    #[tokio::test]
+    async fn without_the_setting_a_socket_is_unchanged() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        declined(&format!("ws://127.0.0.1:{port}/"), Policy::OPEN, &listener).await;
+        declined(&format!("ws://localhost:{port}/"), Policy::OPEN, &listener).await;
+    }
+}
