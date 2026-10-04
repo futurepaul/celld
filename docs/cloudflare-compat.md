@@ -117,6 +117,9 @@ The `tail` and `email` handlers are unavailable.
   event with code 1006.
 - A Durable Object's `stub.fetch()` call rejects when the handler fails, on the
   owner node and on any other node.
+- When a caller closes a socket that a Durable Object returned from `fetch`,
+  celld waits up to 5 seconds for the object's own close, which the caller then
+  receives. After that, celld echoes the caller's close to the caller.
 
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 
