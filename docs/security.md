@@ -91,6 +91,10 @@ checked after a name is resolved, and the connection goes to the addresses
 that were checked. Use an encrypted overlay such as WireGuard or
 Tailscale when the network does not provide the required confidentiality.
 
+A root in `CELLD_EXTRA_CA_FILE` can vouch for any host name that a Worker
+reaches, as a root in the bundled Mozilla store can. Add only a CA that you
+trust for all of the Workers' outbound traffic.
+
 ## Use the internal operator API
 
 The internal operator API is available in the released binary. It is an alpha

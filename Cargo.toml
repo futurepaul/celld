@@ -115,6 +115,9 @@ crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 percent-encoding = "2"
 proptest = "1"
 rand = "0.8"
+# Test certificates only: a CA and the leaves it signs, for the outbound TLS
+# tests. Its default backend is ring, the one rustls already uses here.
+rcgen = "0.14"
 regex = "1"
 reqwest = { version = "0.12", default-features = false }
 rsa = { version = "0.9", features = ["sha2"] }

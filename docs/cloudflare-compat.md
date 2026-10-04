@@ -77,6 +77,10 @@ from Cloudflare.
   starts because celld keeps no replay copy.
 - A remote Durable Object call waits for a rejected owner generation to change
   for at most `CELLD_OPERATION_DEADLINE_MS`.
+- celld verifies a TLS server against its bundled Mozilla root store, and not
+  the host's store. `CELLD_EXTRA_CA_FILE` adds an operator's roots, such as a
+  private CA. This setting is a celld extension: Cloudflare trusts public CAs
+  only. The same roots apply to outbound WebSockets and TCP sockets.
 
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
@@ -184,7 +188,8 @@ celld provides an always-miss cache because it has no shared edge cache.
 
 - A socket cannot outlive its event. A Durable Object must reconnect during a
   later event.
-- celld verifies a TLS server against its bundled Mozilla root store.
+- celld verifies a TLS server against its bundled Mozilla root store and the
+  roots in `CELLD_EXTRA_CA_FILE`.
 - celld does not block the destination ports that Cloudflare blocks. The fleet
   network controls the egress policy.
 

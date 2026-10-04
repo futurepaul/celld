@@ -382,6 +382,7 @@ pub mod runtime;
 pub mod startup;
 pub mod storage;
 pub mod telemetry;
+pub mod tls_roots;
 pub mod wake;
 pub mod wake_entry;
 pub mod wake_format;
