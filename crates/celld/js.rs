@@ -3819,6 +3819,14 @@ impl InFlight {
         self.reply.is_none() && self.gated_reply.is_none()
     }
 
+    /// Whether the handler's promise has settled and still waits to be
+    /// answered: settled in another event's turn, which cannot answer for
+    /// this one (`watch_handler_settlement`). Asking clears it, so a driver
+    /// polls once for each settlement rather than spinning.
+    pub(crate) fn take_settled_unanswered(&mut self) -> bool {
+        self.context.take_handler_settled() && self.reply.is_some()
+    }
+
     /// Whether a native operation can still resume JavaScript for this event.
     ///
     /// A detached reply gate is host work. It cannot keep handler operations
@@ -5148,6 +5156,58 @@ struct AlarmClaim {
     now_ms: i64,
 }
 
+/// Tell this event's driver when its handler's promise settles, whichever
+/// turn that happens in.
+///
+/// A cell event's continuations can run inside another event's turn: a fetch
+/// handler that awaits an outbound socket's `close` resumes in that socket's
+/// close event, and if that was its last await it returns there. The turn
+/// that settles the promise belongs to the other event and answers only for
+/// that one, so this event's driver learns of it only by entering the isolate
+/// again. With no op of its own outstanding it polls; but one with an op
+/// still pending (a container monitor's long poll, a long timer) waited on
+/// that op instead, and held a finished response until the op ended, or the
+/// client gave up. workerd answers once the promise settles, so a reaction on
+/// the promise wakes the driver to answer it.
+///
+/// Only a tracked context can be named from the reaction, and only a tracked
+/// context's continuations run in other events' turns.
+fn watch_handler_settlement(
+    tc: &mut v8::PinScope,
+    promise: v8::Local<v8::Promise>,
+    context: &IoContext,
+) {
+    fn settled(
+        scope: &mut v8::PinScope,
+        args: v8::FunctionCallbackArguments,
+        _rv: v8::ReturnValue<v8::Value>,
+    ) {
+        let Ok(id) = args.data().try_cast::<v8::BigInt>() else {
+            return;
+        };
+        let (id, lossless) = id.u64_value();
+        debug_assert!(lossless, "an IoContext id fits in a u64");
+        // A context that already retired has no driver left to wake.
+        if let Some(context) = actor_runtime_state(scope).io_context(id) {
+            context.note_handler_settled();
+        }
+    }
+    if promise.state() != v8::PromiseState::Pending {
+        return;
+    }
+    let Some(id) = context.continuation_id() else {
+        return;
+    };
+    let data = v8::BigInt::new_from_u64(tc, id).into();
+    // Both only fail on a terminating isolate, which ends the event anyway.
+    let Some(reaction) = v8::Function::builder(settled).data(data).build(tc) else {
+        return;
+    };
+    // One function for both outcomes, so the derived promise always fulfills
+    // and a rejected handler is still the driver's to report.
+    let _ = promise.then2(tc, reaction, reaction);
+}
+
 /// Start one cell event: the half that runs before the handler can suspend.
 ///
 /// Every cell event does the same four things — name the cell it belongs to,
@@ -5203,6 +5263,7 @@ fn start_cell_event<'s>(
             if capture_frames {
                 ws_capture_set_promise(&context, v8::Global::new(tc, promise));
             }
+            watch_handler_settlement(tc, promise, &context);
             let entry = InFlight {
                 runtime_state: runtime_state.clone(),
                 promise: v8::Global::new(tc, promise),
@@ -6330,10 +6391,11 @@ impl Worker {
     /// Enter the isolate solely to see whether another event settled this
     /// one's promise.
     ///
-    /// A promise resolved by a different entry has no waker pointing here,
-    /// so the driving task cannot be told and has to look. That is why this
-    /// is a poll and not an event, and it is the same reason the blocking
-    /// loop woke every 10 ms.
+    /// A promise resolved by a different entry has no op of this entry's
+    /// behind it, so the driving task has to look. A cell event's handler
+    /// promise carries a reaction that wakes the driver when it settles
+    /// (`watch_handler_settlement`); anything else is still found by the
+    /// poll, the same reason the blocking loop woke every 10 ms.
     pub fn turn_poll(&mut self, entry: &mut InFlight) -> Vec<Op> {
         let Some(inner) = self.inner.as_mut() else {
             return Vec::new();
@@ -10625,9 +10687,21 @@ pub struct IoContext {
     /// pays that back on a loop that turns once per operation the event
     /// completes.
     handed_len: AtomicUsize,
-    /// Wakes this event's driver when `handed` grows or a pending entrypoint
-    /// starts. Both changes can make the driver's current wait obsolete.
+    /// Wakes this event's driver when `handed` grows, a pending entrypoint
+    /// starts, or `handler_settled` is set. Each change can make the driver's
+    /// current wait obsolete.
     handed_wake: tokio::sync::Notify,
+    /// Set by the reaction `watch_handler_settlement` puts on a cell event's
+    /// handler promise, in whichever turn settles it.
+    ///
+    /// A handler that awaited another event's work (an outbound socket's
+    /// close, a WebSocket message) resumes inside that event's turn, and so it
+    /// can return there too. Nothing of this event's own completes then, and a
+    /// driver parked on an op that may not finish for a long time (a long
+    /// poll, a long timer) did not look at the promise again until it did:
+    /// the response was ready and was not sent. The flag is what tells the
+    /// driver to look.
+    handler_settled: AtomicBool,
     /// IDs of nested `WorkerEntrypoint` calls that have not settled. The
     /// driver consumes these IDs only when the request has no native work, so
     /// it can reject the calls instead of timing out the enclosing event.
@@ -10814,6 +10888,7 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: limits.and_then(|limits| limits.sub_requests),
             subrequests: AtomicUsize::new(0),
@@ -10846,6 +10921,7 @@ impl IoContext {
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
+            handler_settled: AtomicBool::new(false),
             pending_events: Mutex::new(HashSet::new()),
             subrequest_limit: runtime_state
                 .resource_limits
@@ -10904,6 +10980,20 @@ impl IoContext {
 
     fn accepts_handed_ops(&self) -> bool {
         self.handed.lock().unwrap().is_some()
+    }
+
+    /// The handler's promise settled, in this event's turn or another's.
+    ///
+    /// The driver may be parked on an op of its own that has nothing to do
+    /// with the answer, so it is woken here exactly as a hand-off wakes it.
+    fn note_handler_settled(&self) {
+        self.handler_settled.store(true, Ordering::Release);
+        self.handed_wake.notify_one();
+    }
+
+    /// Whether the handler settled since the driver last asked, clearing it.
+    fn take_handler_settled(&self) -> bool {
+        self.handler_settled.swap(false, Ordering::AcqRel)
     }
 
     fn register_pending_event(&self, id: u64) {
