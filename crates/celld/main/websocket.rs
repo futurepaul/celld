@@ -321,6 +321,11 @@ impl OutboundWebSocketSink {
     }
 }
 
+/// How long a caller that closed a socket bound to a Durable Object's waits
+/// for the object's close in answer, before its own is echoed. The same bound
+/// `websocket_task` gives a close handler's frames.
+const CLOSE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Carry frames between a Durable Object's socket and a client end another
 /// isolate in this process kept, after a `stub.fetch` upgrade.
 ///
@@ -331,7 +336,9 @@ impl OutboundWebSocketSink {
 /// `dispatch_ws_message` into the cell, a pull queue out to the caller —
 /// which is also why a hibernatable server end needs nothing special here.
 ///
-/// The task ends when either side closes, and it unregisters both.
+/// The task ends when either side closes, and it unregisters both. A close
+/// the caller starts waits for the cell's answer first, for at most
+/// `CLOSE_ANSWER_WAIT`.
 async fn local_websocket_pipe(
     app: AppHandle,
     id: u64,
@@ -403,7 +410,41 @@ async fn local_websocket_pipe(
         }
     }
     if let Some((code, reason)) = caller_close {
-        let _ = dispatch_ws_closed(&app, &target.scope, target.id, code, reason, true).await;
+        let _ =
+            dispatch_ws_closed(&app, &target.scope, target.id, code, reason.clone(), true).await;
+        // The caller has started the closing handshake, and its close event
+        // is the cell's answer, as it is on workerd: a cell answers in its
+        // close handler, or after a round trip of its own (a cell that
+        // bridges this socket onto another closes once that one has). The
+        // pipe used to end here and drop that answer, so the caller saw an
+        // abnormal 1006 with an `error` for a close both ends made cleanly.
+        // What the cell sends before its close still reaches the caller.
+        //
+        // Bounded: a cell that never answers would hold this task and both
+        // registrations. Past the bound the caller's own close is echoed, as
+        // `websocket_task` echoes an external client's when the handler sends
+        // none.
+        let answer = tokio::time::timeout(CLOSE_ANSWER_WAIT, async {
+            loop {
+                match from_cell.recv().await {
+                    Some(celld::js::WsOut::Text(text)) => {
+                        if pull.send(celld::js::WsPull::Text(text)).await.is_err() {
+                            return None;
+                        }
+                    }
+                    Some(celld::js::WsOut::Binary(bytes)) => {
+                        if pull.send(celld::js::WsPull::Binary(bytes)).await.is_err() {
+                            return None;
+                        }
+                    }
+                    Some(celld::js::WsOut::Close(code, reason)) => return Some((code, reason)),
+                    None => return None,
+                }
+            }
+        })
+        .await;
+        let (code, reason) = answer.ok().flatten().unwrap_or((code, reason));
+        let _ = pull.send_close(code, reason, true);
     }
     app.websocket_closed(target.scope.clone(), target.id);
     celld::js::ws_unregister(target.id);
