@@ -296,6 +296,8 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(node) = value("CELLD_NODE")? {
         crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLD_NODE {error}"))?;
     }
+    // Reads and checks the bundle, and keeps it for the TLS clients.
+    crate::tls_roots::load()?;
     Ok(())
 }
 

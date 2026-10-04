@@ -3701,6 +3701,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Run(settings) => settings,
     };
     celld::startup::raise_file_limit();
+    celld::tls_roots::log_configuration();
     let max_resident = celld::env_vars::optional("CELLD_MAX_RESIDENT_CELLS")?
         // celld has no resident ceiling unless the operator configures one.
         // The clean-sheet prototype originally defaulted to eight, which
