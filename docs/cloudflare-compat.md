@@ -123,6 +123,9 @@ The `tail` and `email` handlers are unavailable.
   If the owner connection fails between frames before a Close, the ingress sends
   code 1012. If a frame is incomplete, the ingress closes the transport instead.
 - `acceptWebSocket()` throws above 90 percent of the V8 heap limit.
+- When a caller closes a socket that a Durable Object returned from `fetch`,
+  celld waits up to 5 seconds for the object's own close, which the caller then
+  receives. After that, celld echoes the caller's close to the caller.
 
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 
