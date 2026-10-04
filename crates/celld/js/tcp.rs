@@ -65,10 +65,9 @@ fn insert(id: u64, stream: Duplex) {
     );
 }
 
-/// Mozilla's roots, the same choice `ws_client` makes and for the same
-/// reason: a downloaded celld must reach TLS hosts on a machine with no
-/// `/etc/ssl/certs`. Test TLS servers use a root injected through the
-/// gated seam below.
+/// Mozilla's roots and the operator's (`tls_roots`), the set `ws_client` and
+/// a Worker's fetch trust too. Test TLS servers use a root injected through
+/// the gated seam below.
 #[cfg(celld_internal_tests)]
 fn test_root() -> &'static Mutex<Option<Vec<u8>>> {
     static ROOT: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
@@ -97,9 +96,7 @@ fn tls_connector() -> tokio_rustls::TlsConnector {
 }
 
 fn build_tls_connector(extra_root: Option<Vec<u8>>) -> tokio_rustls::TlsConnector {
-    let mut roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
+    let mut roots = crate::tls_roots::store();
     if let Some(der) = extra_root {
         let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
     }

@@ -12,6 +12,8 @@
 //! the same way and connects to the addresses it kept, so a name cannot
 //! resolve a second time to somewhere else. Service bindings, Durable Object
 //! calls, and celld's own clients do not pass through here.
+//!
+//! The same clients carry the roots a Worker trusts (`client`).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -204,8 +206,20 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     }
 }
 
-/// A client for a Worker's fetch, with this node's egress policy.
+/// A client for a Worker's fetch, with this node's egress policy and roots.
+///
+/// reqwest is built with the platform's roots as well as Mozilla's
+/// (object_store asks for them, and Cargo unifies a crate's features across
+/// the build), so every client would read the host's store, or the
+/// `SSL_CERT_FILE` and `SSL_CERT_DIR` that replace it. A Worker trusts what
+/// its WebSockets and `connect()` trust instead: Mozilla's roots and the
+/// operator's `CELLD_EXTRA_CA_FILE` (tls_roots.rs).
 pub fn client(builder: reqwest::ClientBuilder) -> reqwest::Client {
+    let mut builder = builder.tls_built_in_native_certs(false);
+    for certificate in crate::tls_roots::extra_certificates() {
+        let certificate = reqwest::Certificate::from_der(certificate).expect("a checked root");
+        builder = builder.add_root_certificate(certificate);
+    }
     let builder = if public_only() { builder.dns_resolver(Arc::new(PublicOnlyResolver)) } else { builder };
     builder.build().expect("build an outbound HTTP client")
 }
