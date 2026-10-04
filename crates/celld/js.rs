@@ -822,6 +822,17 @@ impl EgressGate {
 
 /// Whether `url` names a port of the calling cell's own container.
 fn own_container_port(context: &IoContext, url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (parsed.host_str(), parsed.port_or_known_default()) else {
+        return false;
+    };
+    own_container_address(context, host, port)
+}
+
+/// Whether `host:port` is a port of the calling cell's own container.
+fn own_container_address(context: &IoContext, host: &str, port: u16) -> bool {
     let Some(frame) = current_cell_event(context) else {
         return false;
     };
@@ -830,13 +841,28 @@ fn own_container_port(context: &IoContext, url: &str) -> bool {
         .as_ref()
         .map(|root| root.cell.clone())
         .unwrap_or_else(|| frame.storage.clone());
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    let (Some(host), Some(port)) = (parsed.host_str(), parsed.port_or_known_default()) else {
-        return false;
-    };
     crate::container::owns_address(&cell, host, port)
+}
+
+/// The egress rule a Worker's socket obeys (egress.rs): the node's, except
+/// to the calling object's own container port, which the node handed it
+/// (`getTcpPort`), as `op_fetch` lets it through. `own_container` asks only
+/// when the node limits egress. The cell comes from the active event, so
+/// JavaScript cannot name another cell's container.
+fn socket_egress(own_container: impl FnOnce() -> bool) -> crate::egress::Policy {
+    if crate::egress::public_only() && own_container() {
+        return crate::egress::Policy::OPEN;
+    }
+    crate::egress::Policy::node()
+}
+
+/// A failed outbound socket's message: an egress refusal as it stands, so it
+/// starts `egress refused:` as `fetch`'s does; anything else after `what`.
+fn socket_failure(what: &str, error: &anyhow::Error) -> String {
+    match error.downcast_ref::<crate::egress::EgressRefused>() {
+        Some(refused) => refused.0.clone(),
+        None => format!("{what}: {error}"),
+    }
 }
 
 /// The cell event the executing JavaScript belongs to.

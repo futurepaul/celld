@@ -156,21 +156,29 @@ pub(super) fn op_tcp_connect(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("connect(): {error}")),
     };
+    // The dial takes the node's egress rule, as `fetch` does, and the
+    // calling object's own container port (`getTcpPort().connect()`) is let
+    // through as it is there.
+    let context = event_context(scope);
+    let egress = socket_egress(|| own_container_address(&context, &request.hostname, request.port));
     // The id exists before the connection does, so the request context
     // can own the socket even if the event ends mid-connect.
     let id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(id);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
+    let gate = egress_gate_request(&context, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        let stream = tokio::net::TcpStream::connect((request.hostname.as_str(), request.port))
-            .await
-            .map_err(|error| {
-                format!(
+        let stream = match egress.connect(&request.hostname, request.port).await {
+            Ok(stream) => stream,
+            // The refusal as it stands, so it reads `egress refused:` first.
+            Err(crate::egress::DialError::Refused(refused)) => return Err(refused.0),
+            Err(crate::egress::DialError::Io(error)) => {
+                return Err(format!(
                     "connection to {}:{} failed: {error}",
                     request.hostname, request.port
-                )
-            })?;
+                ))
+            }
+        };
         let remote = stream.peer_addr().map(|a| a.to_string()).ok();
         let local = stream.local_addr().map(|a| a.to_string()).ok();
         let mut stream: Duplex = Box::new(stream);
