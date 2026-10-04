@@ -36,6 +36,9 @@ pub struct OutboundWsReq {
     /// op derives it from the running event, so the socket routes through
     /// the facet's root and never names the facet as a cell.
     pub facet: Option<FacetSocket>,
+    /// The egress rule the dial to `url` obeys (egress.rs), chosen by the op
+    /// on the JavaScript thread, where the calling object is known.
+    pub egress: crate::egress::Policy,
     pub reply: tokio::sync::oneshot::Sender<Result<OutboundWsOpen>>,
 }
 

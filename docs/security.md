@@ -51,10 +51,11 @@ Every path to a runtime class therefore demands the fleet secret. The HMAC
 does not authenticate tunnel bytes after establishment and does not encrypt
 traffic, so it does not replace the private network.
 
-A Worker's own `fetch` runs in the same process as the peer client, so a
-network firewall cannot keep it off the private network. Set
-`CELLD_EGRESS_PUBLIC_ONLY=1` to refuse non-public destinations, checked after
-a name is resolved.
+A Worker's own `fetch`, outbound WebSockets, and `connect()` sockets run in
+the same process as the peer client, so a network firewall cannot keep them
+off the private network. Set `CELLD_EGRESS_PUBLIC_ONLY=1` to refuse
+non-public destinations on all three, checked after a name is resolved; the
+connection goes to the addresses that were checked.
 
 ## Use the internal operator API
 
