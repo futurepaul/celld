@@ -2688,7 +2688,10 @@ class DurableObjectState {
     this._scope = scope;
     this._aborted = false;
     this.storage = new DurableObjectStorage(scope, this);
-    this.facets = new DurableObjectFacets(this);
+    // Defined, not assigned: code in the object's isolate may have made the
+    // prototype's `facets` an accessor with no setter (a platform locking
+    // its app out of facets), and an assignment would then throw.
+    Object.defineProperty(this, "facets", { value: new DurableObjectFacets(this), writable: true, configurable: true, enumerable: true });
     this._gate = Promise.resolve();
     this._blockDepth = 0;
     const facet = __cell.facetConfigs[scope];
