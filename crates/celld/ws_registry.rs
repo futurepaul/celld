@@ -32,6 +32,9 @@ pub struct OutboundWsReq {
     /// to run and no connection to open: the host only has to carry frames
     /// between two isolates.
     pub target: Option<WsTarget>,
+    /// The egress rule the dial to `url` obeys (egress.rs), chosen by the op
+    /// on the JavaScript thread, where the calling object is known.
+    pub egress: crate::egress::Policy,
     pub reply: tokio::sync::oneshot::Sender<Result<OutboundWsOpen>>,
 }
 

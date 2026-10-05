@@ -895,7 +895,9 @@ async fn presence_session(
         &runtime.listen,
         hostname,
     )?;
-    let socket = match crate::ws_client::connect(&url, headers).await {
+    // celld's own connection, not a Worker's: the egress rule does not apply.
+    let egress = crate::egress::Policy::OPEN;
+    let socket = match crate::ws_client::connect(&url, headers, egress).await {
         Ok(connection) => connection.socket,
         Err(crate::ws_client::Error::Declined(declined))
             if matches!(declined.status.as_u16(), 401 | 403) =>
