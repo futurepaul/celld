@@ -2194,7 +2194,8 @@ enum Wake {
     /// call inside JavaScript so the enclosing event can catch the failure.
     PendingEventIdle,
     /// Nothing of its own is outstanding, but another event of the same cell
-    /// still could settle it. Look in and see.
+    /// still could settle it; or another event's turn has settled it. Look in
+    /// and see.
     Poll,
 }
 
@@ -2230,6 +2231,11 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
         // this driver here rather than through `adopt`, because the turn that
         // took it belongs to another entry. See `js::adopt`.
         adopt(ops, entry.take_handed_ops());
+        // Another event's turn settled the handler, and that turn answers only
+        // for its own event. Whatever op this one still waits on, look now.
+        if entry.take_settled_unanswered() {
+            return Wake::Poll;
+        }
         // A WorkerEntrypoint call is its own PendingEvent. When no referenced
         // native operation can move it, reject that call inside JavaScript.
         // An unreferenced signal listener cannot make progress and must not
