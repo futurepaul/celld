@@ -7511,17 +7511,9 @@ fn take_loader_owner(owner: &LoaderOwner) -> Vec<tokio::sync::watch::Receiver<Lo
 // Keep admission policy inside the registry: a caller-selected bound would let
 // different entry points disagree about how much process capacity remains.
 const MAX_LOADED_WORKERS: usize = 256;
-
-/// fork: `CELLD_LOADED_WORKERS_MAX` sets the process bound (a node's
-/// operator, and tests that fill it). Reserve only the final process slot
-/// per principal. A fixed fraction needlessly reduces single-script
-/// capacity without giving every competing principal a share.
-fn max_loaded_workers() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("CELLD_LOADED_WORKERS_MAX").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n >= 2).unwrap_or(MAX_LOADED_WORKERS)
-    })
-}
+// Reserve only the final process slot. A fixed fraction needlessly reduces
+// single-script capacity without giving every competing principal a share.
+const MAX_LOADED_WORKERS_PER_PRINCIPAL: usize = MAX_LOADED_WORKERS - 1;
 
 /// Check both limits and install the live state under one registry lock. A
 /// separate check and insert lets concurrent isolates exceed either limit.
@@ -7530,8 +7522,7 @@ fn admit_loaded_worker(
     state: tokio::sync::watch::Receiver<LoaderState>,
 ) -> Result<u64, String> {
     let mut registry = loader_registry().lock().unwrap();
-    let max = max_loaded_workers();
-    let principal_limit = max - 1;
+    let principal_limit = MAX_LOADED_WORKERS_PER_PRINCIPAL;
     let principal_count = registry
         .values()
         .filter(|entry| entry.owner.principal == owner.principal)
@@ -7542,9 +7533,9 @@ fn admit_loaded_worker(
             owner.principal.script, owner.principal.generation
         ));
     }
-    if registry.len() >= max {
+    if registry.len() >= MAX_LOADED_WORKERS {
         return Err(format!(
-            "worker loader: too many loaded workers (limit {max})"
+            "worker loader: too many loaded workers (limit {MAX_LOADED_WORKERS})"
         ));
     }
 
