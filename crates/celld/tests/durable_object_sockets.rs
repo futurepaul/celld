@@ -1,7 +1,9 @@
 //! Durable Object WebSockets under `celld dev`, as workerd runs them.
 //!
 //! An object's fetch handler that awaited an outbound socket's events answers
-//! once it returns, whatever op of its own is still pending.
+//! once it returns, whatever op of its own is still pending; and a socket one
+//! object returns to another from `fetch` carries text and binary both ways
+//! and closes cleanly, with the closing handshake the object answers.
 
 #![cfg(unix)]
 // A test of the binary drives real processes, sockets, files, and clocks.
@@ -54,6 +56,84 @@ export class Client {
 export default {
   fetch(request, env) {
     return env.CLIENT.getByName("client").fetch(request);
+  },
+};
+"#;
+
+const PAIR_WORKER: &str = r#"
+export class Server {
+  async fetch(request) {
+    const answer = new URL(request.url).searchParams.get("answer");
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    server.addEventListener("message", (event) => {
+      if (typeof event.data === "string") {
+        server.send(`text ${event.data}`);
+      } else {
+        server.send(new Uint8Array(event.data).map((byte) => byte + 1));
+      }
+    });
+    server.addEventListener("close", (event) => {
+      const reply = () => server.close(1000, `answered ${event.code} ${event.reason}`);
+      if (answer === "at once") reply();
+      // After a round trip of its own, as an object that bridges this socket
+      // onto another closes once the other end has.
+      if (answer === "later") setTimeout(reply, 50);
+    });
+    return new Response(null, { status: 101, webSocket: client });
+  }
+}
+
+export class Caller {
+  constructor(ctx, env) {
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const answer = url.searchParams.get("answer");
+    const rounds = Number(url.searchParams.get("rounds"));
+    const stub = this.env.SERVER.getByName("server");
+    const seen = [];
+    for (let round = 0; round < rounds; round++) {
+      const response = await stub.fetch(
+        `https://server/?answer=${encodeURIComponent(answer)}`,
+        { headers: { Upgrade: "websocket" } },
+      );
+      const socket = response.webSocket;
+      socket.accept();
+      const got = [];
+      let replied;
+      const replies = new Promise((resolve) => { replied = resolve; });
+      const late = setTimeout(() => replied(), 10_000);
+      socket.addEventListener("message", (event) => {
+        got.push(typeof event.data === "string"
+          ? event.data
+          : Array.from(new Uint8Array(event.data)).join(","));
+        if (got.length === 3) replied();
+      });
+      socket.addEventListener("error", () => got.push("error"));
+      const closed = new Promise((resolve) => {
+        socket.addEventListener("close", (event) => {
+          resolve(`close ${event.code} ${event.reason} ${event.wasClean}`);
+        });
+      });
+      socket.send(`hello ${round}`);
+      socket.send(new Uint8Array([round, 10]));
+      socket.send(new Uint8Array([round, 20]).buffer);
+      await replies;
+      clearTimeout(late);
+      socket.close(1000, "done");
+      got.push(await closed);
+      seen.push(got);
+    }
+    return Response.json(seen);
+  }
+}
+
+export default {
+  fetch(request, env) {
+    return env.CALLER.getByName("caller").fetch(request);
   },
 };
 "#;
@@ -330,4 +410,45 @@ fn a_handler_that_returns_in_a_socket_event_is_answered_at_once() {
             dev.output()
         );
     }
+}
+
+#[test]
+fn a_socket_one_object_returns_to_another_carries_both_ways_and_closes_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    project(
+        dir.path(),
+        PAIR_WORKER,
+        &[("CALLER", "Caller"), ("SERVER", "Server")],
+    );
+    let dev = Dev::start(dir.path());
+    let round = |round: u8, close: &str| {
+        serde_json::json!([
+            format!("text hello {round}"),
+            format!("{},11", round + 1),
+            format!("{},21", round + 1),
+            close,
+        ])
+    };
+
+    // The server end answers the caller's close in its close handler, and
+    // after a round trip of its own: the caller sees that answer, cleanly.
+    for answer in ["at once", "later"] {
+        let (seen, _) = dev.json(&format!("/?answer={}&rounds=3", answer.replace(' ', "%20")));
+        let close = "close 1000 answered 1000 done true";
+        assert_eq!(
+            seen,
+            serde_json::json!([round(0, close), round(1, close), round(2, close)]),
+            "{answer}:\n{}",
+            dev.output()
+        );
+    }
+
+    // A server end that never answers: past the bound the caller's own close
+    // is echoed, still clean, rather than held open for good.
+    let (seen, took) = dev.json("/?answer=never&rounds=1");
+    assert_eq!(seen, serde_json::json!([round(0, "close 1000 done true")]));
+    assert!(
+        took >= Duration::from_secs(5) && took < Duration::from_secs(5) + ANSWER_BOUND,
+        "the echo came after {took:?}"
+    );
 }
