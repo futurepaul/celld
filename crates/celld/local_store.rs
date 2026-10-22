@@ -108,16 +108,26 @@ impl LocalStore {
             .ok_or_else(|| not_found(key))
     }
 
-    fn metadata(&self) -> object_store::Result<Vec<StoredObject>> {
+    /// Every object whose key starts with `prefix`, in key order, without its
+    /// body.
+    ///
+    /// Stopgap, on the fork only until upstream lists by prefix: this read
+    /// every row and left the prefix to its callers, and reading a row's
+    /// `attributes`, stored after its body, walks the body's overflow pages.
+    /// Each listing read the whole bucket, LTX included. The keys that share a
+    /// prefix are one run of the primary key's index (BINARY order is byte
+    /// order), so the scan starts at `prefix` and stops at the first key past
+    /// it. The callers still filter as before.
+    fn metadata(&self, prefix: &str) -> object_store::Result<Vec<StoredObject>> {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
                 "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
-                 FROM objects ORDER BY key",
+                 FROM objects WHERE key >= ?1 ORDER BY key",
             )
             .map_err(db_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([prefix], |row| {
                 Ok(StoredObject {
                     key: row.get(0)?,
                     body: row.get(1)?,
@@ -128,7 +138,15 @@ impl LocalStore {
                 })
             })
             .map_err(db_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
+        let mut objects = Vec::new();
+        for row in rows {
+            let object = row.map_err(db_error)?;
+            if !object.key.starts_with(prefix) {
+                break;
+            }
+            objects.push(object);
+        }
+        Ok(objects)
     }
 
     fn put_sync(
@@ -296,7 +314,8 @@ impl ObjectStore for LocalStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let prefix = prefix.cloned();
-        let result = self.metadata().and_then(|objects| {
+        let scan = prefix.as_ref().map_or("", Path::as_ref);
+        let result = self.metadata(scan).and_then(|objects| {
             objects
                 .into_iter()
                 .map(|object| object_meta(&object))
@@ -321,7 +340,7 @@ impl ObjectStore for LocalStore {
         let prefix = prefix.cloned().unwrap_or_default();
         let mut common_prefixes = BTreeSet::new();
         let mut objects = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(prefix.as_ref())? {
             let location = stored_location(&object.key)?;
             let Some(mut remainder) = location.prefix_match(&prefix) else {
                 continue;
@@ -372,7 +391,7 @@ impl PaginatedListStore for LocalStore {
         let delimiter = options.delimiter.as_deref();
         let limit = options.max_keys.unwrap_or(usize::MAX);
         let mut entries: Vec<(String, Option<Path>, Option<ObjectMeta>)> = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(prefix)? {
             let Some(remainder) = object.key.strip_prefix(prefix) else {
                 continue;
             };
@@ -565,5 +584,76 @@ fn precondition(path: &str) -> Error {
     Error::Precondition {
         path: path.to_string(),
         source: Box::new(std::io::Error::other("the ETag does not match")),
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+    use futures_util::TryStreamExt as _;
+
+    /// A listing returns its prefix's objects and nothing else, whatever sorts
+    /// on either side of the prefix: a sibling that shares its string, a key
+    /// equal to it, and a key whose next character is U+10FFFF.
+    #[tokio::test]
+    async fn a_listing_returns_exactly_its_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalStore::open(directory.path().join("objects.sqlite3")).unwrap();
+        let top = "cells/a/ltx/\u{10FFFF}";
+        for key in [
+            "cells/a/ltw/1",
+            "cells/a/ltx",
+            "cells/a/ltx/1",
+            "cells/a/ltx/2",
+            "cells/a/ltx/e1/3",
+            top,
+            "cells/a/ltxz/1",
+            "cells/b/ltx/1",
+        ] {
+            store
+                .put_sync(
+                    key.to_string(),
+                    Bytes::from_static(b"x"),
+                    PutOptions::default(),
+                )
+                .unwrap();
+        }
+        let keys = |metas: &[ObjectMeta]| -> Vec<String> {
+            metas.iter().map(|meta| meta.location.to_string()).collect()
+        };
+
+        let prefix = Path::from("cells/a/ltx");
+        let listed: Vec<ObjectMeta> = store.list(Some(&prefix)).try_collect().await.unwrap();
+        assert_eq!(
+            keys(&listed),
+            ["cells/a/ltx/1", "cells/a/ltx/2", "cells/a/ltx/e1/3", top]
+        );
+
+        let delimited = store.list_with_delimiter(Some(&prefix)).await.unwrap();
+        assert_eq!(
+            keys(&delimited.objects),
+            ["cells/a/ltx/1", "cells/a/ltx/2", top]
+        );
+        assert_eq!(delimited.common_prefixes, [Path::from("cells/a/ltx/e1")]);
+
+        let options = |page_token| PaginatedListOptions {
+            max_keys: Some(2),
+            page_token,
+            ..PaginatedListOptions::default()
+        };
+        let first = store
+            .list_paginated(Some("cells/a/ltx/"), options(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            keys(&first.result.objects),
+            ["cells/a/ltx/1", "cells/a/ltx/2"]
+        );
+        let second = store
+            .list_paginated(Some("cells/a/ltx/"), options(first.page_token))
+            .await
+            .unwrap();
+        assert_eq!(keys(&second.result.objects), ["cells/a/ltx/e1/3", top]);
+        assert_eq!(second.page_token, None);
     }
 }
