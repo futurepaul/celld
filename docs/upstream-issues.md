@@ -35,6 +35,12 @@ checked against v0.6.3 (2026-10-22).
   outright stayed in a fragment's presence ("you and 1 other here") where
   workerd dropped it. fragment's card renderer now closes its browser
   before killing it.
+- **`celld dev` halts itself on one slow lease renewal.** A single node,
+  with no peers to hand cells to, still renews a 10 s node lease every
+  ~3.3 s, and one renewal that stalled past its 2.5 s timeout (the box
+  was busy) fenced the node ("SELF-FENCE: node lease not renewed within
+  TTL", exit 3), taking the whole dev stack down. No setting lengthens the
+  lease. Seen on v0.6.3, 2026-10-22.
 - **A private CA reaches only `fetch`.** Stock celld trusts
   `SSL_CERT_FILE` for a Worker's `fetch`, but not for outbound WebSockets
   or `connect()`. This fork's `CELLD_EXTRA_CA_FILE` covers all three.
