@@ -1,0 +1,6 @@
+{
+  "name": "local-store-list-repro",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "repro" }]
+}
