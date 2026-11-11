@@ -19,8 +19,10 @@
 //! `CELLD_EGRESS_ALLOW` ([`Allow`]): a name it lists keeps its private
 //! addresses too, and an address in a network it lists passes. It never
 //! opens loopback, link-local, unspecified, multicast or broadcast
-//! addresses, `localhost`, a name it marks `!`, or an address of this
-//! machine's own: those stay refused whatever it lists.
+//! addresses, `localhost`, or a name it marks `!`: those stay refused
+//! whatever it lists, public or not. Under `CELLD_EGRESS_PUBLIC_ONLY`, an
+//! address of this machine's own is refused too, list or no list, however
+//! public it is: a Worker never reaches its own node's listeners.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -33,10 +35,16 @@ pub fn public_only() -> bool {
     })
 }
 
-/// The most entries `CELLD_EGRESS_ALLOW` holds.
+/// The most entries `CELLD_EGRESS_ALLOW` holds. Fragment's deployment
+/// config, the list's usual source, bounds its own entries at 64
+/// (`fragment_core::egress::ALLOW_MAX`) and adds its `!` markers (the
+/// platform's host and suffix) when it renders this variable, so a node
+/// takes more than it: this bound is a node's own guard on what it reads,
+/// not the product's limit.
 pub const ALLOW_MAX: usize = 128;
-/// The longest entry: a DNS name's most (253 bytes), a `*.` or `!` and a
-/// `!*.` spare.
+/// The longest entry: a DNS name's most (253 bytes) with a `*.` or `!`
+/// before it. Fragment's own entries are at most 255 bytes; its `!`
+/// markers are a name and one byte.
 pub const ALLOW_ENTRY_MAX_BYTES: usize = 256;
 
 /// The internal hosts a node's operator opens (`CELLD_EGRESS_ALLOW`), a
@@ -144,11 +152,17 @@ fn never_net(ip: IpAddr, prefix: u8) -> Option<&'static str> {
     NEVER_NETS.iter().find(|(n, len, _)| overlap((ip, prefix), (*n, *len))).map(|(_, _, what)| *what)
 }
 
-/// Whether `ip` is one of this machine's own addresses: one a socket can
-/// bind to. A node set to bind any address (`ip_nonlocal_bind`) calls
-/// every address its own, and the allowlist opens none.
-fn own_address(ip: IpAddr) -> bool {
-    std::net::UdpSocket::bind((ip, 0)).is_ok()
+/// Whether `ip` may be one of this machine's own addresses: one a socket
+/// can bind to, or one the probe cannot tell about (any error but "not an
+/// address here"), which is refused as if it were. Asked afresh each time,
+/// so an address the machine gains (DHCP, a tailnet) counts at once. A
+/// node set to bind any address (`ip_nonlocal_bind`) calls every address
+/// its own and reaches none.
+pub(crate) fn maybe_own(ip: IpAddr) -> bool {
+    match std::net::UdpSocket::bind((ip, 0)) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::AddrNotAvailable,
+    }
 }
 
 impl Allow {
@@ -207,21 +221,31 @@ impl Allow {
         Ok(allow)
     }
 
+    /// Whether the list names nothing at all, neither to open nor to keep
+    /// shut.
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.under.is_empty() && self.nets.is_empty()
+        self.names.is_empty() && self.under.is_empty() && self.nets.is_empty() && self.never.is_empty()
+    }
+
+    /// Whether `host` is a name the list never opens (`!`): refused
+    /// whatever it resolves to, a public address included.
+    pub fn never_names(&self, host: &str) -> bool {
+        let name = name_of(bare(host));
+        name.parse::<IpAddr>().is_err() && self.never.iter().any(|n| at_or_under(&name, n))
     }
 
     /// Whether the list opens `ip`, which `host` resolved to (or which it
     /// is, as a literal): a name it lists, or an address in a network it
-    /// lists, and never one of what it never opens.
+    /// lists, and never one of what it never opens. The machine's own
+    /// addresses are the policy's to refuse (`Policy`), list or no list.
     pub fn admits(&self, host: &str, ip: IpAddr) -> bool {
         let ip = plain(ip);
-        if never_net(ip, bits(ip).1).is_some() {
+        if never_net(ip, bits(ip).1).is_some() || self.never_names(host) {
             return false;
         }
         let name = name_of(bare(host));
         let literal = name.parse::<IpAddr>().is_ok();
-        if !literal && (at_or_under(&name, "localhost") || self.never.iter().any(|n| at_or_under(&name, n))) {
+        if !literal && at_or_under(&name, "localhost") {
             return false;
         }
         let named = !literal
@@ -229,11 +253,11 @@ impl Allow {
                 || self.under.iter().any(|n| {
                     name.strip_suffix(n.as_str()).and_then(|l| l.strip_suffix('.')).is_some_and(|l| !l.is_empty() && !l.contains('.'))
                 }));
-        (named || self.nets.iter().any(|(n, len)| overlap((*n, *len), (ip, bits(ip).1)))) && !own_address(ip)
+        named || self.nets.iter().any(|(n, len)| overlap((*n, *len), (ip, bits(ip).1)))
     }
 }
 
-/// This node's allowlist (`CELLD_EGRESS_ALLOW`), when it lists anything.
+/// This node's allowlist (`CELLD_EGRESS_ALLOW`), when it names anything.
 pub fn allowed() -> Option<&'static Allow> {
     static ALLOW: OnceLock<Allow> = OnceLock::new();
     let allow = ALLOW.get_or_init(|| {
@@ -317,18 +341,20 @@ fn bare(host: &str) -> &str {
 }
 
 /// The refusal for a host that is an IP literal `public` keeps out and
-/// `allow` does not open.
-fn host_refused(host: &str, public: fn(IpAddr) -> bool, allow: Option<&Allow>) -> Option<EgressRefused> {
+/// `allow` does not open, or one `own` claims.
+fn host_refused(host: &str, public: fn(IpAddr) -> bool, allow: Option<&Allow>, own: fn(IpAddr) -> bool) -> Option<EgressRefused> {
     let ip: IpAddr = bare(host).parse().ok()?;
-    (!public(ip) && !allow.is_some_and(|a| a.admits(host, ip)))
-        .then(|| EgressRefused(format!("egress refused: {ip} is not a public address")))
+    if !public(ip) && !allow.is_some_and(|a| a.admits(host, ip)) {
+        return Some(EgressRefused(format!("egress refused: {ip} is not a public address")));
+    }
+    own(ip).then(|| EgressRefused(format!("egress refused: {ip} is this node's own address")))
 }
 
-/// The refusal for a URL whose host is a non-public IP literal this node's
-/// allowlist does not open.
+/// The refusal for a URL whose host is an IP literal this node keeps out:
+/// its own, or a non-public one its allowlist does not open.
 pub fn literal_refused(url: &str) -> Option<EgressRefused> {
     let parsed = reqwest::Url::parse(url).ok()?;
-    host_refused(parsed.host_str()?, is_public, allowed())
+    host_refused(parsed.host_str()?, is_public, allowed(), maybe_own)
 }
 
 /// The refusal for a redirect, when this node limits egress.
@@ -360,21 +386,27 @@ impl std::fmt::Display for DialError {
 
 /// The addresses of `host:port` that `public` (or `allow`) lets a
 /// connection reach: an IP literal as it is, a name's public addresses and
-/// those `allow` opens, refused when it has none. `fetch`'s resolver and
-/// every socket dial take their addresses from here.
+/// those `allow` opens, refused when it has none. Whatever lets an address
+/// in, a name `allow` marks `!` and an address `own` claims are refused.
+/// `fetch`'s resolver and every socket dial take their addresses from here.
 async fn public_addrs(
     host: &str,
     port: u16,
     public: fn(IpAddr) -> bool,
     allow: Option<&Allow>,
+    own: fn(IpAddr) -> bool,
 ) -> Result<Vec<SocketAddr>, DialError> {
-    if let Some(refused) = host_refused(host, public, allow) {
+    if let Some(refused) = host_refused(host, public, allow, own) {
         return Err(DialError::Refused(refused));
+    }
+    if allow.is_some_and(|a| a.never_names(host)) {
+        return Err(DialError::Refused(EgressRefused(format!("egress refused: {host} is never reached"))));
     }
     // A name the system resolver reads as a number (`127.1`, `2130706433`)
     // is a name here: it resolves, and the filter judges what it became.
     let all = tokio::net::lookup_host((bare(host), port)).await.map_err(DialError::Io)?;
-    let kept: Vec<SocketAddr> = all.filter(|a| public(a.ip()) || allow.is_some_and(|al| al.admits(host, a.ip()))).collect();
+    let kept: Vec<SocketAddr> =
+        all.filter(|a| (public(a.ip()) || allow.is_some_and(|al| al.admits(host, a.ip()))) && !own(a.ip())).collect();
     if kept.is_empty() {
         return Err(DialError::Refused(EgressRefused(format!(
             "egress refused: {host} resolves to no public address"
@@ -392,6 +424,9 @@ pub struct Policy {
     public: Option<fn(IpAddr) -> bool>,
     /// What the operator opens beside it (`CELLD_EGRESS_ALLOW`).
     allow: Option<&'static Allow>,
+    /// Whether an address may be this machine's own, refused whenever
+    /// `public` limits anything (`maybe_own`).
+    own: fn(IpAddr) -> bool,
 }
 
 impl std::fmt::Debug for Policy {
@@ -403,10 +438,10 @@ impl std::fmt::Debug for Policy {
 impl Policy {
     /// No limit: a node without the setting, celld's own connections, and an
     /// object's own container port, which the node handed it (`getTcpPort`).
-    pub const OPEN: Policy = Policy { public: None, allow: None };
+    pub const OPEN: Policy = Policy { public: None, allow: None, own: maybe_own };
 
     /// Public addresses only.
-    pub const PUBLIC: Policy = Policy { public: Some(is_public), allow: None };
+    pub const PUBLIC: Policy = Policy { public: Some(is_public), allow: None, own: maybe_own };
 
     /// This node's rule for a Worker's socket.
     pub fn node() -> Policy {
@@ -423,7 +458,7 @@ impl Policy {
         let Some(public) = self.public else {
             return tokio::net::TcpStream::connect((host, port)).await.map_err(DialError::Io);
         };
-        let addrs = public_addrs(host, port, public, self.allow).await?;
+        let addrs = public_addrs(host, port, public, self.allow, self.own).await?;
         tokio::net::TcpStream::connect(&addrs[..]).await.map_err(DialError::Io)
     }
 }
@@ -434,7 +469,7 @@ struct PublicOnlyResolver;
 impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         Box::pin(async move {
-            match public_addrs(name.as_str(), 0, is_public, allowed()).await {
+            match public_addrs(name.as_str(), 0, is_public, allowed(), maybe_own).await {
                 Ok(public) => Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs),
                 Err(DialError::Refused(refused)) => Err(Box::new(refused) as Box<dyn std::error::Error + Send + Sync>),
                 Err(DialError::Io(error)) => Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
@@ -470,9 +505,10 @@ pub(crate) mod tests {
         is_public(s.parse().unwrap())
     }
 
-    /// A rule under which loopback stands in for the public internet, so a
-    /// test can watch an allowed dial land without leaving the machine.
-    pub(crate) const LOOPBACK_IS_PUBLIC: Policy = Policy { public: Some(|ip| ip.is_loopback()), allow: None };
+    /// A rule under which loopback stands in for the public internet (and
+    /// so is no address of this machine's), so a test can watch an allowed
+    /// dial land without leaving the machine.
+    pub(crate) const LOOPBACK_IS_PUBLIC: Policy = Policy { public: Some(|ip| ip.is_loopback()), allow: None, own: |_| false };
 
     /// Hosts a public-only rule refuses, as `connect()` and a URL name them:
     /// loopback, private, link-local (the metadata service), shared,
@@ -529,9 +565,9 @@ pub(crate) mod tests {
     // Valid: a public literal is kept as it is, with no lookup.
     #[tokio::test]
     async fn a_public_literal_is_kept() {
-        let addrs = public_addrs("1.1.1.1", 443, is_public, None).await.unwrap();
+        let addrs = public_addrs("1.1.1.1", 443, is_public, None, maybe_own).await.unwrap();
         assert_eq!(addrs, ["1.1.1.1:443".parse::<SocketAddr>().unwrap()]);
-        let addrs = public_addrs("[2606:4700::1111]", 443, is_public, None).await.unwrap();
+        let addrs = public_addrs("[2606:4700::1111]", 443, is_public, None, maybe_own).await.unwrap();
         assert_eq!(addrs, ["[2606:4700::1111]:443".parse::<SocketAddr>().unwrap()]);
     }
 
@@ -617,7 +653,8 @@ pub(crate) mod tests {
         assert_eq!(a.nets, [(ip("10.20.0.0"), 16), (ip("100.101.102.103"), 32), (ip("10.30.0.0"), 16), (ip("fd7a:115c:a1e0::5"), 128)]);
         assert_eq!(a.never, ["fragment.corp.internal"]);
         assert!(Allow::parse("").unwrap().is_empty() && Allow::parse(" , ").unwrap().is_empty());
-        assert!(Allow::parse("!fragment.corp.internal").unwrap().is_empty(), "a `!` alone opens nothing");
+        let shut = Allow::parse("!fragment.corp.internal").unwrap();
+        assert!(!shut.is_empty() && !shut.admits("fragment.corp.internal", ip("10.0.0.1")), "a `!` alone opens nothing, and is kept");
     }
 
     // Invalid: out of shape, past the bounds, and the never set, alone or
@@ -662,10 +699,6 @@ pub(crate) mod tests {
         ] {
             assert!(!a.admits(host, ip(to)), "{host} at {to}");
         }
-        if let Some(own) = own_v4() {
-            let mine = Allow::parse(&format!("box.corp,{own}/32")).unwrap();
-            assert!(!mine.admits("box.corp", own) && !mine.admits(&own.to_string(), own), "the machine's own {own}");
-        }
     }
 
     // A literal the list opens is kept for the dial with no lookup; one it
@@ -673,9 +706,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_listed_literal_is_kept() {
         let a = Allow::parse("10.255.0.0/16").unwrap();
-        let addrs = public_addrs("10.255.0.1", 80, is_public, Some(&a)).await.unwrap();
+        let addrs = public_addrs("10.255.0.1", 80, is_public, Some(&a), maybe_own).await.unwrap();
         assert_eq!(addrs, ["10.255.0.1:80".parse::<SocketAddr>().unwrap()]);
-        let message = match public_addrs("10.254.0.1", 80, is_public, Some(&a)).await {
+        let message = match public_addrs("10.254.0.1", 80, is_public, Some(&a), maybe_own).await {
             Err(DialError::Refused(refused)) => refused.0,
             other => panic!("expected a refusal, got {other:?}"),
         };
@@ -691,8 +724,73 @@ pub(crate) mod tests {
         let port = listener.local_addr().unwrap().port();
         let allow: &'static Allow = Box::leak(Box::new(Allow::parse(&format!("{own}/32")).unwrap()));
         let message = refusal(Policy { allow: Some(allow), ..Policy::PUBLIC }.connect(&own.to_string(), port).await);
-        assert_eq!(message, format!("egress refused: {own} is not a public address"));
+        assert_eq!(message, format!("egress refused: {own} is this node's own address"));
         let open = Policy::OPEN.connect(&own.to_string(), port).await.unwrap();
         first_accepted_is(&listener, &open).await;
+    }
+
+    // Review round 1, reproduction 1: a `!` name is refused even when DNS
+    // answers it with public addresses (the platform's public host).
+    #[tokio::test]
+    async fn a_never_name_with_a_public_answer_is_refused() {
+        let allow = Allow::parse("wiki.internal,!one.one.one.one").unwrap();
+        match public_addrs("one.one.one.one", 80, is_public, Some(&allow), maybe_own).await {
+            Err(DialError::Refused(refused)) => assert!(refused.0.starts_with("egress refused: "), "{}", refused.0),
+            Err(DialError::Io(error)) => eprintln!("skipped: one.one.one.one does not resolve here ({error})"),
+            Ok(addrs) => panic!("a `!` name reached {addrs:?}"),
+        }
+        // the same, offline: loopback stands in for the public internet
+        let allow = Allow::parse("wiki.internal,!localhost").unwrap();
+        let kept = public_addrs("localhost", 80, |ip| ip.is_loopback(), Some(&allow), |_| false).await;
+        assert!(matches!(kept, Err(DialError::Refused(_))), "{kept:?}");
+    }
+
+    // Review round 1, reproduction 2: an address the rule calls public but
+    // that is this machine's own stays shut (a node's global address).
+    #[tokio::test]
+    async fn an_own_address_the_rule_calls_public_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let allow: &'static Allow = Box::leak(Box::new(Allow::parse("wiki.internal").unwrap()));
+        // the stand-in, with this machine's real probe in place of its "none"
+        let rule = Policy { allow: Some(allow), own: maybe_own, ..LOOPBACK_IS_PUBLIC };
+        let message = refusal(rule.connect("127.0.0.1", port).await);
+        assert!(message.starts_with("egress refused: "), "{message}");
+        let open = Policy::OPEN.connect("127.0.0.1", port).await.unwrap();
+        first_accepted_is(&listener, &open).await;
+    }
+
+    // With no list at all, public-only still refuses this machine's own
+    // address, however public the rule calls it: by literal and by name.
+    #[tokio::test]
+    async fn with_no_list_an_own_address_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let everything_public = Policy { public: Some(|_| true), allow: None, own: maybe_own };
+        for host in ["127.0.0.1", "localhost"] {
+            let message = refusal(everything_public.connect(host, port).await);
+            assert!(message.starts_with("egress refused: "), "{host}: {message}");
+        }
+        assert_eq!(
+            host_refused("127.0.0.1", |_| true, None, maybe_own).map(|r| r.0).as_deref(),
+            Some("egress refused: 127.0.0.1 is this node's own address")
+        );
+        let open = Policy::OPEN.connect("127.0.0.1", port).await.unwrap();
+        first_accepted_is(&listener, &open).await;
+    }
+
+    // The probe: this machine's addresses are its own, an address no
+    // interface has is not, and one it cannot tell about is refused.
+    #[test]
+    fn the_own_address_probe() {
+        assert!(maybe_own(ip("127.0.0.1")));
+        assert!(!maybe_own(ip("10.255.255.254")) || own_v4() == Some(ip("10.255.255.254")));
+        assert!(!maybe_own(ip("1.1.1.1")));
+        if let Some(own) = own_v4() {
+            assert!(maybe_own(own), "{own}");
+        }
+        // a link-local IPv6 address names no interface: the probe cannot
+        // tell (EINVAL, not EADDRNOTAVAIL), so it is refused
+        assert!(maybe_own(ip("fe80::1")));
     }
 }
