@@ -97,6 +97,11 @@ webpki-roots.workspace = true
 libc.workspace = true
 nix.workspace = true
 
+[build-dependencies]
+# build.rs hashes the v8 crate's binding and finds it with cargo metadata.
+serde_json.workspace = true
+sha2.workspace = true
+
 [dev-dependencies]
 lz4_flex.workspace = true
 rcgen.workspace = true

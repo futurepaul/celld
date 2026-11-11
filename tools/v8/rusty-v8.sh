@@ -37,6 +37,22 @@ crate_version() {
   awk '/^name = "v8"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$ROOT/Cargo.lock"
 }
 
+# The SHA-256 of the v8 crate's own binding for $TARGET, read from the
+# .crate archive whose hash Cargo.lock records, never from the extracted
+# source, which the v8 build script overwrites when a binding mirror is set.
+crate_binding_sha256() {
+  local crate=$1 want file
+  want=$(awk -v v="version = \"$1\"" '/^name = "v8"$/ { getline; if ($0 == v) { getline; getline; gsub(/checksum = |"/, ""); print; exit } }' "$ROOT/Cargo.lock")
+  [[ ${#want} == 64 ]] || die "no checksum for v8 $crate in Cargo.lock"
+  (cd "$ROOT" && cargo fetch --locked >/dev/null)
+  for file in "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/*/"v8-$crate.crate"; do
+    [[ -f $file && $(sha256sum "$file" | cut -d' ' -f1) == "$want" ]] || continue
+    tar -xzOf "$file" "v8-$crate/gen/$BINDING" | sha256sum | cut -d' ' -f1
+    return
+  done
+  die "no v8-$crate.crate with Cargo.lock's checksum $want in the cargo cache"
+}
+
 # A value from .cargo/config.toml's [env] table, or empty.
 pinned() {
   [[ -f $CONFIG ]] || return 0
@@ -268,7 +284,7 @@ dist_crate() { sed -n 's/^rusty_v8: v\([0-9.]*\) .*/\1/p' "$1/BUILDINFO"; }
 tag_for() { echo "rusty_v8-v$1-v8-$2"; }
 
 cmd_pin() {
-  local dist crate v8 sha url check
+  local dist crate v8 sha url check binding_sha
   dist=$(dist_dir)
   crate=$(dist_crate "$dist")
   v8=$(dist_v8 "$dist")
@@ -280,23 +296,27 @@ cmd_pin() {
   curl -fsSL --retry 3 -o "$check/$ARCHIVE" "$url" || die "$url is not published; run publish first"
   [[ $(sha256sum "$check/$ARCHIVE" | cut -d' ' -f1) == "$sha" ]] || die "$url does not serve this build"
   rm -rf "$check"
+  binding_sha=$(crate_binding_sha256 "$crate")
   mkdir -p "$(dirname "$CONFIG")"
   cat > "$CONFIG" <<EOF
 # celld links V8 from our own rusty_v8 build, not denoland's prebuilt
 # archive. tools/v8/rusty-v8.sh pin writes this file; docs/v8.md says why.
 #
 # The v8 build script fetches RUSTY_V8_ARCHIVE and checks it against
-# RUSTY_V8_ARCHIVE_SHA256 before use. Every value is forced over the
-# environment. crates/celld/build.rs refuses the variables that would bring
-# other V8 code in (a binding mirror, URL or path; trybuild; a source build)
-# and any target but $TARGET, the only one with an archive.
+# RUSTY_V8_ARCHIVE_SHA256 before use. crates/celld/build.rs checks the
+# binding the v8 crate compiles against CELLD_V8_BINDING_SHA256 (the
+# crate's own, from the .crate Cargo.lock checks), refuses the variables
+# that would bring other V8 code in (a binding mirror, URL or path;
+# trybuild; a source or debug build), and any target but $TARGET, the
+# only one with an archive. Every value is forced over the environment.
 [env]
 CELLD_V8_VERSION = { value = "$v8", force = true }
 RUSTY_V8_ARCHIVE = { value = "$url", force = true }
 RUSTY_V8_ARCHIVE_SHA256 = { value = "$sha", force = true }
+CELLD_V8_BINDING_SHA256 = { value = "$binding_sha", force = true }
 RUSTY_V8_SKIP_DOWNLOAD = { value = "0", force = true }
 EOF
-  say "pinned V8 $v8: $url sha256 $sha"
+  say "pinned V8 $v8: $url sha256 $sha; the crate's binding sha256 $binding_sha"
 }
 
 # Build celld and run its tests: against the pin, or against an archive,
