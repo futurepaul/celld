@@ -5,12 +5,13 @@
 #   sudo contrib/systemd/install.sh CELLD ESBUILD
 #
 # It neither starts the service nor touches the sandcastle engine: README.md
-# has those steps. Running it again updates the binaries and the unit and
-# keeps the settings.
+# has those steps. Running it again updates the binaries and the unit, keeps
+# the settings' contents, and sets every owner and mode again.
 set -euo pipefail
 
 user=fragment-celld
-[[ $(id -u) == 0 ]] || { echo "install.sh: run it as root" >&2; exit 1; }
+die() { echo "install.sh: $*" >&2; exit 1; }
+[[ $(id -u) == 0 ]] || die "run it as root"
 [[ $# == 2 && -f $1 && -f $2 ]] || { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 
@@ -28,18 +29,27 @@ install -o root -g root -m 0755 "$2" "/usr/local/lib/$user/esbuild"
 # The cell's project is root's too. Its .celld links to the state directory,
 # which systemd creates for the service (StateDirectory=).
 install -d -o root -g root -m 0755 /opt/fragment /opt/fragment/cell
-if [[ ! -L /opt/fragment/cell/.celld ]]; then
-  if [[ -e /opt/fragment/cell/.celld ]]; then
-    echo "install.sh: /opt/fragment/cell/.celld exists and is not a symlink; move it aside" >&2
-    exit 1
-  fi
-  ln -s "/var/lib/$user/cell" /opt/fragment/cell/.celld
+state=/opt/fragment/cell/.celld
+if [[ -L $state ]]; then
+  [[ $(readlink "$state") == "/var/lib/$user/cell" ]] ||
+    die "$state links to $(readlink "$state"), not /var/lib/$user/cell; remove it"
+elif [[ -e $state ]]; then
+  die "$state exists and is not a symlink; move it aside"
+else
+  ln -s "/var/lib/$user/cell" "$state"
 fi
 
-# Settings: root's, readable by the service's group, never overwritten.
+# Settings: root's, readable by the service's group. An existing file keeps
+# its contents, not its owner or mode.
 install -d -o root -g "$user" -m 0750 "/etc/$user"
-if [[ ! -e /etc/$user/celld.env ]]; then
-  install -o root -g "$user" -m 0640 "$here/celld.env" "/etc/$user/celld.env"
+env_file=/etc/$user/celld.env
+if [[ -L $env_file ]]; then
+  die "$env_file is a symlink; make it a file"
+elif [[ -e $env_file ]]; then
+  chown root:"$user" "$env_file"
+  chmod 0640 "$env_file"
+else
+  install -o root -g "$user" -m 0640 "$here/celld.env" "$env_file"
 fi
 
 install -o root -g root -m 0644 "$here/fragment-celld.service" /etc/systemd/system/fragment-celld.service
