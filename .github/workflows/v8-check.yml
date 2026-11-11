@@ -1,0 +1,52 @@
+name: V8 check
+
+# Says whether the V8 celld links (.cargo/config.toml) is behind the newest
+# patch on its branch, or on a branch Chrome no longer supports. docs/v8.md
+# has the rebuild procedure. The job fails when a newer patch exists on our
+# branch, which one `tools/v8/rusty-v8.sh update` fixes; a branch out of
+# Chrome's support is reported in the summary, since moving needs a new
+# rusty_v8. GitHub runs the schedule only from the default branch.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".cargo/config.toml"
+      - "Cargo.lock"
+      - "tools/v8/**"
+      - ".github/workflows/v8-check.yml"
+  push:
+    branches:
+      - selfhost
+    paths:
+      - ".cargo/config.toml"
+      - "Cargo.lock"
+      - "tools/v8/**"
+      - ".github/workflows/v8-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check V8
+        run: |
+          set +e
+          tools/v8/rusty-v8.sh check > report.txt
+          status=$?
+          set -e
+          cat report.txt
+          { echo '```'; cat report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          case $status in
+            0 | 11) ;;
+            10) echo "::error::A newer V8 patch exists: run tools/v8/rusty-v8.sh update"; exit 1 ;;
+            *) echo "::error::the check itself failed ($status)"; exit 1 ;;
+          esac
+          if [ "$status" = 11 ]; then
+            echo "::warning::Chrome no longer supports this V8 branch; see docs/v8.md (Version policy)"
+          fi

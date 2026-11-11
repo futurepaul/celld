@@ -10,6 +10,8 @@ ARG TARGETARCH
 ARG CELLD_PROFILE=release
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# The V8 pin (docs/v8.md): without it celld does not compile.
+COPY .cargo ./.cargo
 COPY crates ./crates
 RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=celld-cargo-git,target=/usr/local/cargo/git,sharing=locked \

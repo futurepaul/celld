@@ -1850,6 +1850,13 @@ fn reject_reason(tc: &mut v8::PinScope, p: v8::Local<v8::Promise>) -> String {
     }
 }
 
+/// The V8 this build links, as V8 reports it: rusty_v8 builds V8 with the
+/// embedder string `-rusty`. The fork links its own rusty_v8 archive, pinned
+/// by version and SHA-256 in `.cargo/config.toml` (docs/v8.md). A build
+/// without that pin would link denoland's prebuilt V8 instead, so it does not
+/// compile.
+pub const V8_VERSION: &str = concat!(env!("CELLD_V8_VERSION"), "-rusty");
+
 pub struct Engine;
 impl Engine {
     pub fn init() {
@@ -1858,6 +1865,13 @@ impl Engine {
         // which poisoned the global state when both ran.
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
+            // The build checked the archive's hash; this checks that the
+            // archive is the V8 the pin names, before any code runs on it.
+            assert_eq!(
+                v8::V8::get_version(),
+                V8_VERSION,
+                "celld links a V8 other than the pinned one"
+            );
             #[cfg(celld_internal_tests)]
             v8::V8::set_flags_from_string("--expose-gc");
             // No `v8::icu::set_common_data_78` call: the rusty_v8 152 prebuilt
@@ -12886,3 +12900,11 @@ pub fn init_engine_for_tests() {
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+
+#[cfg(test)]
+mod v8_pin_tests {
+    #[test]
+    fn celld_links_the_pinned_v8() {
+        assert_eq!(v8::V8::get_version(), super::V8_VERSION);
+    }
+}

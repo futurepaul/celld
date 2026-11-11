@@ -18,6 +18,13 @@ therefore reaches the host only through the capabilities in its `env`.
 celld depends on two external boundaries: a trusted private network protects
 the internal listener, and object storage credentials control the fleet.
 
+## Keep V8 current
+
+This fork links its own build of V8, patched to the newest fix Chrome
+shipped on its branch, and pinned by hash. [v8.md](v8.md) has the pin, the
+one-command rebuild, the daily check and the V8 sandbox's cost.
+`celld --version` prints the V8 it links.
+
 ## Separate the listeners
 
 celld opens two HTTP listeners and terminates TLS on neither.
