@@ -2422,15 +2422,16 @@ pub mod internal {
     /// `prepare` and for a re-prepare, and stays still for a cached statement.
     /// (Installing the authorizer expires the statements compiled so far, so
     /// the first sync after this call compiles once more.)
-    pub fn count_sql_compilations(db: &super::Db) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    pub fn count_sql_compilations(db: &mut super::Db) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         use rusqlite::hooks::{AuthContext, Authorization};
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        for conn in [&db.conn, &db.rtx_conn] {
+        for conn in [&mut db.conn, &mut db.rtx_conn] {
             let counter = counter.clone();
             conn.authorizer(Some(move |_: AuthContext<'_>| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Authorization::Allow
-            }));
+            }))
+            .expect("an authorizer installs on an open connection");
         }
         counter
     }
