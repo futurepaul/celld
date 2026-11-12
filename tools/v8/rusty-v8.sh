@@ -398,7 +398,7 @@ RUSTY_V8_SRC_BINDING_PATH = { value = ".cargo/v8/$BINDING", relative = true, for
 CELLD_V8_BINDING_SHA256 = { value = "$binding_sha", force = true }
 RUSTY_V8_SKIP_DOWNLOAD = { value = "0", force = true }
 EOF
-  say "pinned V8 $v8: $url sha256 $sha; the crate's binding sha256 $binding_sha"
+  say "pinned V8 $v8: $url sha256 $sha; the binding sha256 $binding_sha"
 }
 
 # Build celld and run its tests: against the pin, or against an archive,
