@@ -33,7 +33,7 @@ mod local_request;
 mod production;
 pub use celld_logic::{EvictCancellation, EvictError, EvictFailure, EvictRefusal, EvictSuccess};
 pub use effects::StepOutput;
-pub(crate) use effects::{drain_step_output, LeaseRequest};
+pub(crate) use effects::{drain_step_output, requeue_early, LeaseRequest};
 pub use local_request::{LocalRequest, LocalRequestCompletion, LocalRequestFailure};
 
 type EvictionReply = oneshot::Sender<Result<EvictSuccess, EvictError>>;
@@ -157,13 +157,16 @@ impl<V> TimerSlots<V> {
         displaced
     }
 
-    /// Removes the current arm only when both parts of its identity match.
-    pub fn fire(&mut self, slot: &TimerSlot, ordinal: u64) -> Option<V> {
-        if self
-            .armed
+    /// Whether this arm is the slot's current one.
+    pub fn is_armed(&self, slot: &TimerSlot, ordinal: u64) -> bool {
+        self.armed
             .get(slot)
             .is_some_and(|(armed, _)| *armed == ordinal)
-        {
+    }
+
+    /// Removes the current arm only when both parts of its identity match.
+    pub fn fire(&mut self, slot: &TimerSlot, ordinal: u64) -> Option<V> {
+        if self.is_armed(slot, ordinal) {
             self.armed.remove(slot).map(|(_, value)| value)
         } else {
             None
