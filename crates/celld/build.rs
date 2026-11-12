@@ -88,7 +88,7 @@ fn main() {
     // With nothing above set, the v8 build script hands rustc
     // `<its manifest dir>/gen/src_binding_release_<target>.rs`
     // (`RUSTY_V8_SRC_BINDING_PATH`, included by its src/binding.rs).
-    let binding = v8_manifest_dir()
+    let binding = v8_manifest_dir(&target)
         .join("gen")
         .join(format!("src_binding_release_{target}.rs"));
     // Again whenever the file changes, so a binding poisoned after this build
@@ -112,18 +112,28 @@ fn is_sha256(value: &str) -> bool {
 /// The `v8` package's source directory, as Cargo resolves it for this
 /// workspace (registry, vendored or otherwise). It must be crates.io's, with
 /// none of the features that select another build.
-fn v8_manifest_dir() -> PathBuf {
+///
+/// `cargo metadata` is the one interface that names the directory Cargo
+/// compiles a package from, whatever the source replacement or CARGO_HOME;
+/// Cargo exports neither to build scripts, and `v8` has no `links` key to
+/// carry it. It reads every package's manifest, more than `cargo build`
+/// downloads, so it may download too: never `--offline` here, or a first
+/// build fails. An offline build (`CARGO_NET_OFFLINE`, or `net.offline` in
+/// config, both of which it inherits) needs `cargo fetch` first.
+fn v8_manifest_dir(target: &str) -> PathBuf {
     let cargo = std::env::var_os("CARGO").expect("cargo sets CARGO");
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
         .join("Cargo.toml");
     let output = std::process::Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--locked", "--offline", "--manifest-path"])
+        .args(["metadata", "--format-version", "1", "--locked", "--filter-platform", target])
+        .arg("--manifest-path")
         .arg(&manifest)
         .output()
         .expect("run cargo metadata");
     assert!(
         output.status.success(),
-        "cargo metadata failed: {}",
+        "cargo metadata failed; it reads every package's manifest, so an offline build \
+         needs `cargo fetch` first (docs/v8.md): {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).expect("cargo metadata's JSON");
