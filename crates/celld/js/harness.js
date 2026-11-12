@@ -2737,6 +2737,11 @@ class Container {
     return Promise.reject(new Error("interceptOutboundTcp() is not implemented in celld"));
   }
 }
+// Each state's facet manager, for the host's release of it. Private to the
+// harness: the state's own `facets` is the object's to redefine (a platform
+// locking its app out of facets), so a handle on the state itself would be
+// that app's handle too, to use or to replace.
+const __stateFacets = new WeakMap();
 class DurableObjectState {
   constructor(scope) {
     this._scope = scope;
@@ -2744,8 +2749,12 @@ class DurableObjectState {
     this.storage = new DurableObjectStorage(scope, this);
     // Defined, not assigned: code in the object's isolate may have made the
     // prototype's `facets` an accessor with no setter (a platform locking
-    // its app out of facets), and an assignment would then throw.
-    Object.defineProperty(this, "facets", { value: new DurableObjectFacets(this), writable: true, configurable: true, enumerable: true });
+    // its app out of facets), and an assignment would then throw. Such code
+    // can redefine this property too, as a getter that throws, so the host
+    // keeps the manager where nothing on the state leads (__stateFacets).
+    const facets = new DurableObjectFacets(this);
+    __stateFacets.set(this, facets);
+    Object.defineProperty(this, "facets", { value: facets, writable: true, configurable: true, enumerable: true });
     this._gate = Promise.resolve();
     this._blockDepth = 0;
     const facet = __cell.facetConfigs[scope];
@@ -4121,7 +4130,9 @@ const __actorBreak = (scope, reason) => {
 // Storage is not here -- `stop_cell` closes it host-side -- and sockets
 // live in the host registry, so a hibernated cell keeps them.
 const __cellRelease = (scope) => {
-  __cell.instances[scope]?.ctx?.facets?._release();
+  // The state the host built, not the instance's `ctx`: a class may name
+  // its state otherwise, or lock `facets` (see __stateFacets).
+  __stateFacets.get(__cell.instances[scope]?.__celldState)?._release();
   delete __cell.instances[scope];
   delete __cell.idNames[scope];
   delete __cell.facetConfigs[scope];

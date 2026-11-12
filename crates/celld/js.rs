@@ -6800,6 +6800,26 @@ pub(super) fn run_internal_snippet<'s>(
     bootstrap::run_internal_script(scope, None, code, &arguments).ok()
 }
 
+/// [`run_internal_snippet`] for a snippet that only does the host's work:
+/// a failure is the host's error, naming what the snippet threw and where.
+/// A termination stays the isolate's, rethrown to whoever is unwinding it.
+pub(super) fn run_host_snippet(scope: &mut v8::PinScope, what: &str, source: &str) -> Result<()> {
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let tc = &mut tc.init();
+    if run_internal_snippet(tc, source).is_some() {
+        return Ok(());
+    }
+    if tc.has_terminated() {
+        tc.rethrow();
+        return Err(anyhow!("{what}: the isolate is terminating"));
+    }
+    let thrown = tc
+        .stack_trace()
+        .map(|stack| stack.to_rust_string_lossy(tc))
+        .unwrap_or_else(|| exc!(tc));
+    Err(anyhow!("{what}: {thrown}"))
+}
+
 /// `__test_patch_op(name, fn | null)`: route the named op through `fn` for
 /// the rest of the isolate's life, or restore it. The patch receives the op's
 /// arguments and `this`; an op it calls itself runs the real op, so a patch

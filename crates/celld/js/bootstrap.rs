@@ -685,7 +685,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         lines
     };
-    run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("env install failed"))?;
+    run_host_snippet(scope, "env install failed", &src)?;
     if let Some(env) = &config.loader_env {
         let installer = internal_function(scope, "__installLoaderEnv")?;
         // A flat [script, entrypoint, props, ...] array avoids one V8 array
@@ -728,7 +728,7 @@ pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfi
          c.queueLeaseDurationMs = q.leaseDurationMs;\n\
          c.queueLimits = q.limits;"
     );
-    run_internal_snippet(scope, &source).ok_or_else(|| anyhow!("queue config install failed"))?;
+    run_host_snippet(scope, "queue config install failed", &source)?;
     Ok(())
 }
 
@@ -895,7 +895,7 @@ fn call_extends(
 /// owns it.
 pub(super) fn inject_routing(scope: &mut v8::PinScope, node: &str) -> Result<()> {
     let src = format!("__celld.__cell.node = {node:?};");
-    run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("routing install failed"))?;
+    run_host_snippet(scope, "routing install failed", &src)?;
     Ok(())
 }
 
@@ -1007,13 +1007,13 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
     // persists the id name before writing it here, so the take-in below reads
     // it back.
     let source = format!("__celld.__cell.release({cell:?});");
-    run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("adopt failed"))?;
+    run_host_snippet(tc, "adopt failed", &source)?;
     if !owned {
         // A facet of the root's own class lives in this isolate, and nothing
         // else releases it: its realm and connection would outlive the root.
         for facet in storage::embedded_facets(cell) {
             let source = format!("__celld.__cell.release({facet:?});");
-            run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("release failed"))?;
+            run_host_snippet(tc, "release failed", &source)?;
             storage::close(&facet);
             crate::ws_registry::ws_close_facet(&facet, "the parent Durable Object was released");
         }
@@ -1039,7 +1039,7 @@ pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Com
         compat.websocket_standard_binary_type,
         compat.queue_json_messages,
     );
-    run_internal_snippet(scope, &source).ok_or_else(|| anyhow!("compatibility install failed"))?;
+    run_host_snippet(scope, "compatibility install failed", &source)?;
     Ok(())
 }
 
