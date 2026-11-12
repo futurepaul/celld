@@ -381,6 +381,10 @@ pub struct CellContainer {
     /// Written with `send_replace`: a plain `send` discards the value
     /// while nobody subscribes, and `monitor()` usually subscribes late.
     exit: watch::Sender<Option<(u64, Result<RunExit, String>)>>,
+    /// fork: held while the intercepts are sent to the engine, each send the
+    /// whole list as it is once held, so a send that read fewer never
+    /// lands after one that read more (the engine replaces them whole).
+    intercepts_sent: tokio::sync::Mutex<()>,
 }
 
 impl CellContainer {
@@ -807,6 +811,7 @@ impl ContainerEngine {
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
+                    intercepts_sent: tokio::sync::Mutex::new(()),
                 })
             });
             // A returning cell cancels the destroy its eviction armed.
@@ -930,8 +935,8 @@ impl ContainerEngine {
         params: StartParams,
     ) -> anyhow::Result<()> {
         let started = self.create_and_start(cell, params).await;
-        let address = match started {
-            Ok(address) => address,
+        let (address, launched) = match started {
+            Ok(started) => started,
             Err(error) => {
                 // `start()` is fire-and-forget for the object, and its
                 // `monitor()` sees this error only if it was already
@@ -955,7 +960,7 @@ impl ContainerEngine {
         // `destroy()` may have come while the start was under way (`start()`
         // returns at once, and its object can destroy at once): what the
         // start made goes too, and the run ends destroyed.
-        let destroyed = {
+        let (destroyed, added) = {
             let mut state = cell.state.lock().unwrap();
             let destroyed = state.destroyed == Some(run) || state.run != run;
             if !destroyed {
@@ -963,8 +968,23 @@ impl ContainerEngine {
                 state.address = address;
                 state.info.started = true;
             }
-            destroyed
+            (destroyed, state.intercepts.len() > launched)
         };
+        // fork: an intercept the object added while the start was under way
+        // (its `start()` returns at once, and an object sets its intercepts
+        // right after, as on Cloudflare) was recorded, not sent: the engine
+        // has it now, or the guest's first request to its host went nowhere.
+        if !destroyed && added {
+            if let Err(error) = self.send_intercepts(cell).await {
+                tracing::warn!(
+                    event = "container_intercepts_failed",
+                    cell = %cell.scope,
+                    engine = self.backend.kind(),
+                    error = %format!("{error:#}"),
+                    "the intercepts added during the start did not reach the engine"
+                );
+            }
+        }
         if destroyed {
             self.backend.remove(&cell.name).await;
             cell.exit.send_replace(Some((
@@ -1008,11 +1028,12 @@ impl ContainerEngine {
         .detach();
     }
 
+    /// The container's address, and how many intercepts it started with.
     async fn create_and_start(
         &self,
         cell: &CellContainer,
         params: StartParams,
-    ) -> anyhow::Result<Address> {
+    ) -> anyhow::Result<(Address, usize)> {
         self.backend.prepare().await?;
         self.enforce_instance_ceiling(cell).await?;
         let spec = &cell.spec;
@@ -1071,12 +1092,13 @@ impl ContainerEngine {
                 started: false,
                 memory_bytes,
             };
-            state.intercepts.iter().map(|i| i.rule.clone()).collect()
+            state.intercepts.iter().map(|i| i.rule.clone()).collect::<Vec<_>>()
         };
+        let launched = intercepts.len();
         // A container under a non-default runtime is Docker's matter; the
         // class names one, else the node default.
         let runtime = spec.runtime.clone();
-        self.backend
+        let address = self.backend
             .create_and_start(
                 &cell.name,
                 Launch {
@@ -1094,7 +1116,8 @@ impl ContainerEngine {
                     intercepts,
                 },
             )
-            .await
+            .await?;
+        Ok((address, launched))
     }
 
     /// Wait for the current run to end.
@@ -1140,6 +1163,11 @@ impl ContainerEngine {
 
     /// `interceptOutbound*`: added for the cell's container's life, and to a
     /// running container at once. Cloudflare's count of 128 entries holds.
+    /// fork: a rule the container has already (its scheme and target) takes
+    /// the new binding in its place, as on Cloudflare, where the Sandbox
+    /// SDK's `DirectoryBackup` re-registers its host for each grant and
+    /// deny; adding it again grew the list to the cap, past which every
+    /// intercept was refused. Its index, which the engine names, is kept.
     pub async fn intercept(
         &self,
         cell: &Arc<CellContainer>,
@@ -1153,14 +1181,29 @@ impl ContainerEngine {
             "interceptOutboundHttp() is not supported by celld's {} engine",
             self.backend.kind()
         );
-        let rules = {
+        {
             let mut state = cell.state.lock().unwrap();
+            if let Some(held) = state.intercepts.iter_mut().find(|i| i.rule == rule) {
+                held.route = route;
+                return Ok(());
+            }
             let used: usize = state.intercepts.iter().map(|i| i.rule.entries()).sum();
             anyhow::ensure!(
                 used + rule.entries() <= INTERCEPT_ENTRIES_MAX,
                 "a container takes at most {INTERCEPT_ENTRIES_MAX} intercept entries (a hostname counts two)"
             );
             state.intercepts.push(Intercept { rule, route });
+        }
+        self.send_intercepts(cell).await
+    }
+
+    /// fork: the container's intercepts, all of them as they are once the
+    /// send is held, to the engine, when it runs; a start under way sends
+    /// what was added meanwhile itself (`start`).
+    async fn send_intercepts(&self, cell: &CellContainer) -> anyhow::Result<()> {
+        let _held = cell.intercepts_sent.lock().await;
+        let rules = {
+            let state = cell.state.lock().unwrap();
             let running = state.running && state.info.started;
             running.then(|| state.intercepts.iter().map(|i| i.rule.clone()).collect::<Vec<_>>())
         };

@@ -107,7 +107,10 @@ to the binding the object passed, on the service-call path; HTTPS interception
 uses the CA at `/etc/cloudflare/certs/cloudflare-containers-ca.crt`, as on
 Cloudflare. The socket is beside the node's data when that path fits a Unix
 socket's 107 bytes, and otherwise in `$XDG_RUNTIME_DIR/celld`, named by a hash
-of the node's data directory. `getTcpPort()` reaches a port through a loopback listener per port,
+of the node's data directory. An intercept the object sets while a `start()` is
+under way reaches the engine once the container runs, and a host intercepted
+again takes the new binding in its place, counting once toward the 128 entries.
+`getTcpPort()` reaches a port through a loopback listener per port,
 whose connections take a socket from the engine, TCP over the VM's network
 interface or a relay to the guest's loopback.
 
