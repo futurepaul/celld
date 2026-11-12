@@ -1,7 +1,8 @@
 //! A facet whose code locks its own `ctx.facets` (fragment's platform does,
 //! so an app starts no facets of its own) is still aborted, and released
-//! with its root: celld reaches the facet manager through its own handle on
-//! the state, never through the property an app can redefine.
+//! with its root: celld reaches the facet manager through a handle of its
+//! own, which nothing on the state leads to, so the app can neither use the
+//! manager nor replace the release.
 
 #![cfg(unix)]
 // A test of the binary drives real processes, sockets, files, and clocks.
@@ -16,6 +17,40 @@ import { DurableObject } from "cloudflare:workers";
 
 const APP = `
 import { DurableObject } from "cloudflare:workers";
+
+// A facet manager, wherever it is found: what an app locked out of facets
+// must never reach.
+const isManager = (value) => value !== null &&
+  (typeof value === "object" || typeof value === "function") &&
+  ["get", "abort", "delete"].every((name) => typeof value[name] === "function");
+
+// Every property of the state and of its storage, own and inherited, string
+// and symbol keyed, read through its descriptor: a key holding a manager.
+const managers = (ctx) => {
+  const found = [];
+  for (const [where, root] of [["ctx", ctx], ["storage", ctx.storage]]) {
+    for (let o = root, depth = 0; o !== null && depth < 8; o = Object.getPrototypeOf(o), depth++) {
+      for (const key of Reflect.ownKeys(o)) {
+        const descriptor = Object.getOwnPropertyDescriptor(o, key);
+        let value;
+        try {
+          value = "value" in descriptor ? descriptor.value : descriptor.get?.call(root);
+        } catch {
+          continue;
+        }
+        if (isManager(value)) found.push(where + "." + String(key));
+      }
+    }
+  }
+  return found;
+};
+
+export class Escape extends DurableObject {
+  fetch() {
+    return new Response("unauthorized facet running");
+  }
+}
+
 export class App extends DurableObject {
   constructor(ctx, env) {
     Object.defineProperty(ctx, "facets", {
@@ -24,8 +59,28 @@ export class App extends DurableObject {
     });
     super(ctx, env);
     this.calls = 0;
+    // What an app may try against the host's release of it: replace each
+    // property holding a release with one that throws. Not in the first
+    // release, which probes the state as the host built it.
+    if (RELEASE !== "one") for (const key of Reflect.ownKeys(ctx)) {
+      try {
+        if (typeof ctx[key]?._release === "function")
+          ctx[key] = { _release() { throw new Error("the app replaced the release"); } };
+      } catch {}
+    }
   }
-  fetch() {
+  async fetch(request) {
+    if (new URL(request.url).pathname === "/probe") {
+      let nested;
+      try {
+        // Codex's probe: the manager under another name, starting a facet.
+        const stub = this.ctx._facets.get("unauthorized", () => ({ class: this.ctx.exports.Escape }));
+        nested = await (await stub.fetch("https://escape/")).text();
+      } catch (error) {
+        nested = "refused";
+      }
+      return Response.json({ managers: managers(this.ctx), nested });
+    }
     this.calls += 1;
     return new Response(RELEASE + " call " + this.calls);
   }
@@ -46,7 +101,7 @@ export class Root extends DurableObject {
       })).getDurableObjectClass("App"),
     }));
     try {
-      return await app.fetch("https://app/");
+      return await app.fetch(new URL(request.url).searchParams.has("probe") ? "https://app/probe" : "https://app/");
     } catch (error) {
       return new Response(String(error), { status: 500 });
     }
@@ -91,6 +146,15 @@ fn a_facet_that_locks_its_facets_is_aborted_for_a_newer_release() {
     };
 
     assert_eq!(call("one"), "one call 1");
+    // The app reaches no facet manager through its state, and starts no
+    // facet of its own.
+    let probe: serde_json::Value = serde_json::from_str(&call("one&probe")).unwrap();
+    assert_eq!(
+        probe,
+        serde_json::json!({ "managers": [], "nested": "refused" }),
+        "{}",
+        dev.output()
+    );
     assert_eq!(call("one"), "one call 2");
     // The abort releases the running facet; the next get starts the newer
     // release's in its place.
