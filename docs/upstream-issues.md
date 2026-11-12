@@ -35,6 +35,14 @@ checked against v0.6.3 (2026-10-22).
   outright stayed in a fragment's presence ("you and 1 other here") where
   workerd dropped it. fragment's card renderer now closes its browser
   before killing it.
+- **A facet whose code redefines `ctx.facets` cannot be aborted.** A
+  loaded Worker's object that runs as a facet and makes its own
+  `ctx.facets` a throwing getter (`Object.defineProperty(ctx, "facets",
+  { get() { throw new Error("no facets"); } })`, as a platform locking
+  its app out of facets does) fails `ctx.facets.abort(name)` in its
+  parent: the next call to the facet throws "abort facet: adopt failed".
+  The host releases a residency through `instance.ctx.facets`. Seen on
+  v0.6.3, 2026-11-11; fixed on this fork (PR #10).
 - **`celld dev` halts itself on one slow lease renewal.** A single node,
   with no peers to hand cells to, still renews a 10 s node lease every
   ~3.3 s, and one renewal that stalled past its 2.5 s timeout (the box
