@@ -4251,6 +4251,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
     };
+    // fork: a krun container's WebSocket to a host its object intercepts is
+    // answered as a client's upgrade is (`websocket::handle_intercepted_websocket`).
+    {
+        let app = app.clone();
+        celld::container::answer_intercepted_websockets(Arc::new(move |request, call| {
+            Box::pin(websocket::handle_intercepted_websocket(request, app.clone(), call))
+        }));
+    }
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
     // every posture — a bucket-posture node can take over from a

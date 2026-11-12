@@ -1307,6 +1307,76 @@ async fn run_websocket_upgrade(
     }
 }
 
+/// fork: a krun container's WebSocket upgrade to a host its object
+/// intercepts (container_krun's `InterceptedWebSocket`), answered as a
+/// client's is (`handle_websocket`): the intercept's binding is fetched by
+/// `call`, and on its 101 the engine's connection is pumped to the socket
+/// the binding answered with, a Worker's or a Durable Object's.
+pub(crate) async fn handle_intercepted_websocket(
+    mut request: Request<Incoming>,
+    app: AppHandle,
+    call: celld::engine_api::ServiceFetch,
+) -> HttpReply {
+    let (mut upgrade_response, upgrade) = match fastwebsockets::upgrade::upgrade(&mut request) {
+        Ok(upgrade) => upgrade,
+        Err(error) => return response(StatusCode::BAD_REQUEST, format!("ws upgrade: {error}")),
+    };
+    let Some(runtime) = app.runtime.as_ref() else {
+        return response(StatusCode::BAD_GATEWAY, "no Worker runtime on this node");
+    };
+    let mut answered = match runtime.fetch_service(call).await {
+        Ok(response) => response,
+        Err(error) => {
+            return response(StatusCode::BAD_GATEWAY, format!("the intercept's binding: {error:#}"))
+        }
+    };
+    let websocket = match answered.websocket.take() {
+        Some(websocket) => match PendingWebSocket::new(websocket) {
+            Ok(websocket) => websocket,
+            Err(error) => {
+                return response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("tunneled WebSocket upgrade: {error}"),
+                )
+            }
+        },
+        // the binding refused the upgrade: its answer, as it gave it
+        None => return runtime_response(answered, false),
+    };
+    let target = websocket.target();
+    if answered.status != 101 {
+        if let Some(target) = target {
+            reject_accepted_websocket(&app, target, "unsupported WebSocket route").await;
+        }
+        return response(StatusCode::BAD_GATEWAY, "unsupported WebSocket route");
+    }
+    let mut headers = Vec::new();
+    for (name, value) in &answered.headers {
+        if !forwards_worker_websocket_header(name) {
+            continue;
+        }
+        let parsed = hyper::header::HeaderName::from_bytes(name.as_bytes())
+            .ok()
+            .zip(hyper::header::HeaderValue::from_str(value).ok());
+        let Some(header) = parsed else {
+            if let Some(target) = target {
+                let reason = format!("invalid WebSocket response header: {name}");
+                reject_accepted_websocket(&app, target, &reason).await;
+            }
+            return response(StatusCode::BAD_GATEWAY, "invalid WebSocket response header");
+        };
+        headers.push(header);
+    }
+    for (name, value) in headers {
+        upgrade_response.headers_mut().append(name, value);
+    }
+    let task = Box::pin(run_websocket_upgrade(app.clone(), upgrade, websocket));
+    if app.websockets.send(task).is_err() {
+        return response(StatusCode::SERVICE_UNAVAILABLE, "WebSocket executor stopped");
+    }
+    upgrade_response.map(|body| body.map_err(|never| match never {}).boxed_unsync())
+}
+
 #[cfg(all(test, celld_internal_tests))]
 pub(super) async fn run_websocket_upgrade_for_test(
     task_app: AppHandle,
