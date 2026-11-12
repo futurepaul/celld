@@ -222,6 +222,54 @@ impl Docker {
         Ok(reply)
     }
 
+    /// fork: `post_octets` with a body read from `body` as it arrives and
+    /// sent chunked, never whole in memory: a `docker save` of an image of
+    /// several GB, piped to the krun engine's `POST /v1/images/load`, which
+    /// writes the body to a file as it comes. A read error fails the call.
+    pub async fn post_stream(
+        &self,
+        path: &str,
+        body: impl tokio::io::AsyncRead + Send + 'static,
+        what: &str,
+    ) -> anyhow::Result<Reply> {
+        use futures_util::TryStreamExt as _;
+        let body = http_body_util::StreamBody::new(
+            tokio_util::io::ReaderStream::new(body).map_ok(hyper::body::Frame::data),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("{API}{path}"))
+            .header(HOST, "docker")
+            .header(CONTENT_TYPE, "application/x-tar")
+            .body(body)
+            .context("build Docker request")?;
+        let stream = self.connect().await?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .context("HTTP handshake with the container engine")?;
+        drive(connection);
+        let response = sender
+            .send_request(request)
+            .await
+            .context("send request to the container engine")?;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .context("read Docker response")?
+            .to_bytes();
+        let reply = Reply { status, body };
+        if !reply.status.is_success() {
+            return Err(anyhow!(
+                "{what} failed with [{}] {}",
+                reply.status.as_u16(),
+                reply.message_or_error()
+            ));
+        }
+        Ok(reply)
+    }
+
     /// `POST /exec/{id}/start` with `Upgrade: tcp`: the daemon answers 101
     /// and the connection becomes the process's stdin and its multiplexed
     /// stdout/stderr. The returned stream is that connection.
@@ -279,7 +327,12 @@ impl Docker {
 /// answers, which is why the ambient runtime drives it, as `ws_client`
 /// drives its handshakes.
 #[allow(clippy::disallowed_methods)]
-fn drive(connection: hyper::client::conn::http1::Connection<TokioIo<UnixStream>, Full<Bytes>>) {
+fn drive<B>(connection: hyper::client::conn::http1::Connection<TokioIo<UnixStream>, B>)
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     tokio::spawn(async move {
         let _ = connection.with_upgrades().await;
     });

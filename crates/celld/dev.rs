@@ -618,6 +618,16 @@ async fn deploy_project(config: &Path, with: &[PathBuf], store: &Store, logs: bo
         if logs {
             built.report();
         }
+        // fork: a krun engine never reads Docker's store, where this build
+        // left its images, so they are loaded into it before the node is
+        // asked to start one.
+        if let Ok(crate::container::EngineChoice::Krun(socket)) =
+            crate::container::EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref())
+        {
+            for image in crate::container_krun::load_dev_images(&socket, &built.images).await? {
+                tracing::info!(image = %image, "container image loaded into the krun engine");
+            }
+        }
         if named {
             deploy::write_named(&bucket, &built).await?;
         } else {

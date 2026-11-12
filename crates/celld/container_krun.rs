@@ -369,6 +369,59 @@ impl Backend for KrunBackend {
     }
 }
 
+/// fork: the images `celld dev` built into Docker's store (each under the
+/// content reference a node starts it by: `deploy::content_reference`),
+/// loaded into the krun engine at `socket` when it holds none by that
+/// reference. A dev deploy writes no image tar for its node to load
+/// (`deploy::Options::local_images`), and the engine never reads Docker's
+/// store, so without this a dev node on krun has no image to start. Each
+/// `docker save` is piped to the engine as it is written, never held whole:
+/// an agent's image is several GB. Answers the references it loaded.
+pub(crate) async fn load_dev_images(socket: &Path, images: &[String]) -> anyhow::Result<Vec<String>> {
+    let api = Docker::new(socket);
+    let held = api
+        .expect("GET", "/v1/images", None, "list the krun engine's images")
+        .await?
+        .json()?;
+    let held: Vec<&str> = held
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.get("reference").and_then(Value::as_str))
+        .collect();
+    let mut loaded = vec![];
+    // Bounded: the deployment's images.
+    for image in images {
+        if held.contains(&image.as_str()) {
+            continue;
+        }
+        let mut save = tokio::process::Command::new(crate::deploy::engine_cli())
+            .args(["save", image])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("save container image: is a Docker or Podman CLI on PATH?")?;
+        let tar = save.stdout.take().context("docker save's output")?;
+        let reference =
+            percent_encoding::utf8_percent_encode(image, percent_encoding::NON_ALPHANUMERIC);
+        let load = api
+            .post_stream(&format!("/v1/images/load?reference={reference}"), tar, "load image")
+            .await;
+        let saved = save.wait_with_output().await.context("save container image")?;
+        if !saved.status.success() {
+            return Err(anyhow!(
+                "save container image {image} failed:\n{}",
+                String::from_utf8_lossy(&saved.stderr).trim_end()
+            ));
+        }
+        load.with_context(|| format!("load {image} into the krun engine"))?;
+        loaded.push(image.clone());
+    }
+    Ok(loaded)
+}
+
 fn intercepts_json(intercepts: &[InterceptRule]) -> Value {
     json!(intercepts
         .iter()
