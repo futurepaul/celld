@@ -65,14 +65,14 @@ export class Conformance extends DurableObject {
       await this.ctx.storage.delete("ended");
       c.start({ image: c.images.base, enableInternet: false });
       c.monitor().then(
-        () => this.ctx.storage.put("ended", "resolved"),
-        (error) => this.ctx.storage.put("ended", `exit ${error.exitCode}`),
+        () => this.ctx.storage.put("ended", { how: "resolved", at: Date.now() }),
+        (error) => this.ctx.storage.put("ended", { how: `exit ${error.exitCode}`, at: Date.now() }),
       );
       return new Response("started");
     }
     if (step === "/monitor/kill") {
       c.signal(9);
-      return new Response("killed");
+      return Response.json({ at: Date.now() });
     }
     if (step === "/monitor/ended") {
       return Response.json({ ended: (await this.ctx.storage.get("ended")) ?? null, running: c.running });
@@ -353,7 +353,9 @@ export default {
     const answer = await env.CONFORMANCE.get(env.CONFORMANCE.idFromName(name)).fetch(request);
     const verdict = await answer.json();
     // Each step its own event on a fresh object: the monitor() was set by an
-    // event that answered before the container was killed.
+    // event that answered before the container was killed, and it settles
+    // as the container stops, not at the object's next event (read once,
+    // 3 s after the kill).
     const t0 = Date.now();
     const box = env.CONFORMANCE.get(env.CONFORMANCE.idFromName(`${name}-monitor`));
     const step = (path) => box.fetch(`http://conformance${path}`);
@@ -361,14 +363,13 @@ export default {
     try {
       await step("/monitor/start");
       await sleep(5000);
-      await step("/monitor/kill");
-      const ended = await within(30000, "the exit settles monitor()", async () => {
-        const seen = await (await step("/monitor/ended")).json();
-        return seen.ended === null ? undefined : seen;
-      });
-      result = ended.ended === "exit 137"
-        ? { ok: true, ms: Date.now() - t0, detail: ended }
-        : { ok: false, ms: Date.now() - t0, error: `expected: ${JSON.stringify(ended)}` };
+      const killed = await (await step("/monitor/kill")).json();
+      await sleep(3000);
+      const seen = await (await step("/monitor/ended")).json();
+      const settled = seen.ended && seen.ended.at - killed.at;
+      result = seen.ended?.how === "exit 137" && settled < 2000
+        ? { ok: true, ms: Date.now() - t0, detail: { ...seen, settledMs: settled } }
+        : { ok: false, ms: Date.now() - t0, error: `expected: ${JSON.stringify({ ...seen, settledMs: settled })}` };
     } catch (error) {
       result = { ok: false, ms: Date.now() - t0, error: error?.message ?? String(error) };
     }

@@ -721,6 +721,35 @@ pub async fn shutdown() {
     engine.backend.close();
 }
 
+/// fork: the internal request that wakes an object whose container's run
+/// ended (`wake_cell`). The harness answers it itself (`__dispatchTo`),
+/// never the object's own `fetch()`, after its event settles the
+/// `monitor()` watchers whose runs ended.
+pub const CONTAINER_EXITED_URL: &str = "http://container.celld.internal/exited";
+
+/// fork: wakes the object whose container's run ended, so a `monitor()` an
+/// earlier event set, which could not keep that event alive, settles now,
+/// as Cloudflare settles it when the container stops. A failed wake (a
+/// node stopping) leaves it to the object's next event.
+async fn wake_cell(scope: &str) {
+    let runtime = CONFIG.read().unwrap().as_ref().and_then(|config| config.runtime_manager.clone());
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let wake = crate::engine_api::RuntimeFetch {
+        url: CONTAINER_EXITED_URL.to_string(),
+        method: "POST".to_string(),
+        body: crate::engine_api::RequestBody::Bytes(Bytes::new()),
+        headers: Vec::new(),
+        request_id: None,
+        order: None,
+        parent: None,
+    };
+    if let Err(error) = runtime.fetch_cell(scope.to_string(), None, wake, None).await {
+        tracing::debug!(cell = %scope, error = %format!("{error:#}"), "the container's exit woke no cell");
+    }
+}
+
 /// Connect and load every image of the installed specs, ahead of the
 /// first cell that needs one. Failures are logged: a node without an
 /// engine still serves every other class, and the container class fails
@@ -1030,20 +1059,23 @@ impl ContainerEngine {
                 .wait(&cell_.name)
                 .await
                 .map_err(|error| format!("{error:#}"));
-            let mut state = cell_.state.lock().unwrap();
-            let destroyed = state.destroyed == Some(run);
-            if state.run == run {
-                state.running = false;
-                if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
-                    forwarder.close();
+            let destroyed = {
+                let mut state = cell_.state.lock().unwrap();
+                let destroyed = state.destroyed == Some(run);
+                if state.run == run {
+                    state.running = false;
+                    if let Address::Forwarded(forwarder) = std::mem::take(&mut state.address) {
+                        forwarder.close();
+                    }
                 }
-            }
-            drop(state);
+                destroyed
+            };
             let result = result.map(|exit| RunExit {
                 code: exit.code,
                 destroyed: exit.destroyed || destroyed,
             });
             cell_.exit.send_replace(Some((run, result)));
+            wake_cell(&cell_.scope).await;
         })
         .detach();
     }
