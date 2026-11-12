@@ -65,9 +65,12 @@ mod frames {
     }
 }
 
-/// An intercepted request's body, at most: it is held whole for the
-/// service call.
-const INTERCEPT_BODY_BYTES_MAX: usize = 32 << 20;
+/// fork: an intercepted request's body below this declared length is read
+/// whole for the service call; one at it or past it, or of no declared
+/// length, crosses as a stream, as the node's front streams a request's
+/// (its `INGRESS_STREAM_THRESHOLD`), at most `CELLD_MAX_REQUEST_BODY_BYTES`.
+/// A body held whole, at most 32 MiB, refused an agent's 40 MB sync.
+const INTERCEPT_WHOLE_BYTES_MAX: u64 = 1 << 20;
 /// A `ports.sock` reply, at most.
 const PORT_REPLY_BYTES_MAX: usize = 4096;
 /// A unix socket's path, at most: Linux's `sun_path` holds 108 bytes, the
@@ -914,16 +917,43 @@ async fn intercepted(
         };
         return answer(req, call).await;
     }
-    let body = match http_body_util::Limited::new(req.into_body(), INTERCEPT_BODY_BYTES_MAX)
-        .collect()
-        .await
-    {
-        Ok(b) => b.to_bytes(),
-        Err(_) => {
-            return plain(
-                413,
-                format!("an intercepted request's body is at most {INTERCEPT_BODY_BYTES_MAX} bytes"),
-            )
+    let declared = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let bodyless =
+        matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD) || declared == Some(0);
+    let body = if bodyless || declared.is_some_and(|length| length < INTERCEPT_WHOLE_BYTES_MAX) {
+        match http_body_util::Limited::new(req.into_body(), INTERCEPT_WHOLE_BYTES_MAX as usize)
+            .collect()
+            .await
+        {
+            Ok(b) => crate::engine_api::RequestBody::Bytes(b.to_bytes()),
+            Err(_) => return plain(413, "an intercepted request's body is longer than it said".into()),
+        }
+    } else {
+        let max = match crate::env_vars::positive_or(
+            "CELLD_MAX_REQUEST_BODY_BYTES",
+            crate::actor::DEFAULT_MAX_REQUEST_BODY_BYTES,
+        ) {
+            Ok(max) => max,
+            Err(e) => return plain(502, format!("{e:#}")),
+        };
+        let chunks = http_body_util::Limited::new(req.into_body(), max)
+            .into_data_stream()
+            .map(move |chunk| {
+                chunk.map(|bytes| bytes.to_vec()).map_err(|error| {
+                    if error.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                        format!("an intercepted request's body is at most {max} bytes")
+                    } else {
+                        error.to_string()
+                    }
+                })
+            });
+        match crate::http_streams::register_body_stream(Box::pin(chunks)) {
+            Ok(id) => crate::engine_api::RequestBody::Stream(id),
+            Err(e) => return plain(502, e),
         }
     };
     let call = crate::engine_api::ServiceFetch {
@@ -932,7 +962,7 @@ async fn intercepted(
         entrypoint,
         url,
         method,
-        body: crate::engine_api::RequestBody::Bytes(body),
+        body,
         headers,
         cancel: None,
     };
