@@ -445,15 +445,17 @@ impl CellContainer {
         self.state.lock().unwrap().run
     }
 
-    /// fork: how run `run` ended, once it has, as `monitor()` reads it: its
-    /// exit, or `Err` for an engine failure the wait could not attribute;
-    /// for a run a later start replaced (which drops its exit), `Err`
-    /// saying so. `None` while it runs.
+    /// fork: how run `run` ended, once it has, as `monitor()` reads it (an
+    /// exit of `run` or of a later one): its exit, or `Err` for an engine
+    /// failure the wait could not attribute. `None` until then. The run a
+    /// `monitor()` read can be the one before a start whose run opens late
+    /// (`op_container_start`), whose start clears the exit, so its own end
+    /// is the one heard, as `ContainerEngine::monitor` hears it.
     pub fn ended(&self, run: u64) -> Option<Result<RunExit, String>> {
-        if let Some((ended, result)) = self.exit.borrow().clone() {
-            if ended >= run {
-                return Some(result);
-            }
+        match self.exit.borrow().clone() {
+            Some((ended, result)) if ended >= run => Some(result),
+            _ => None,
+        }
         }
         (self.current_run() > run).then(|| Err("a later start replaced this run".to_string()))
     }
