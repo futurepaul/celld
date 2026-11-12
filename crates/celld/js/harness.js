@@ -2694,8 +2694,11 @@ class DurableObjectState {
     this.storage = new DurableObjectStorage(scope, this);
     // Defined, not assigned: code in the object's isolate may have made the
     // prototype's `facets` an accessor with no setter (a platform locking
-    // its app out of facets), and an assignment would then throw.
-    Object.defineProperty(this, "facets", { value: new DurableObjectFacets(this), writable: true, configurable: true, enumerable: true });
+    // its app out of facets), and an assignment would then throw. Such code
+    // can redefine this property too, as a getter that throws, so the host
+    // reaches the manager through `_facets` alone.
+    this._facets = new DurableObjectFacets(this);
+    Object.defineProperty(this, "facets", { value: this._facets, writable: true, configurable: true, enumerable: true });
     this._gate = Promise.resolve();
     this._blockDepth = 0;
     const facet = __cell.facetConfigs[scope];
@@ -4071,7 +4074,9 @@ const __actorBreak = (scope, reason) => {
 // Storage is not here -- `stop_cell` closes it host-side -- and sockets
 // live in the host registry, so a hibernated cell keeps them.
 const __cellRelease = (scope) => {
-  __cell.instances[scope]?.ctx?.facets?._release();
+  // The state the host built, not the instance's `ctx`: a class may name
+  // its state otherwise, or lock `facets` (see DurableObjectState).
+  __cell.instances[scope]?.__celldState?._facets._release();
   delete __cell.instances[scope];
   delete __cell.idNames[scope];
   delete __cell.facetConfigs[scope];
