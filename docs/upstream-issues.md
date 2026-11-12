@@ -56,6 +56,12 @@ checked against v0.6.3 (2026-10-22).
   Content-Length and an unknown one as chunked. `fetch(request)`, the
   request forwarded whole, keeps its headers. Seen on v0.6.3,
   2026-11-11; fixed on this fork (PR #9).
+- **A teed upload can hang.** A Worker that tees an incoming body past
+  1 MiB (a host stream), forwards one branch to an object and then reads
+  the other sometimes never answers: `curl --data-binary @3mb.bin` timed
+  out in 2 of 4 tries, with or without `Expect: 100-continue`. Seen on
+  v0.6.3, 2026-11-12, while checking a tee's length for PR #9; not
+  fixed.
 - **A private CA reaches only `fetch`.** Stock celld trusts
   `SSL_CERT_FILE` for a Worker's `fetch`, but not for outbound WebSockets
   or `connect()`. This fork's `CELLD_EXTRA_CA_FILE` covers all three.

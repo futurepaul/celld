@@ -203,6 +203,15 @@ class CelldBodyStream extends ReadableStream {
     }
     return super.getReader(options);
   }
+  // Each branch carries all that is left, as on workerd: its length
+  // too, while nothing has been read.
+  tee() {
+    const length = __declaredStreamLength(this);
+    const branches = super.tee();
+    if (length !== undefined)
+      for (const branch of branches) branch._expectedLength = length;
+    return branches;
+  }
   // Cancelling a body stream poisons later consumption: text()
   // and friends reject, as they would over a real socket.
   _cancel(reason) {
@@ -223,6 +232,12 @@ const __declaredBodyLength = (headersJson) => {
   }
   return Number.isSafeInteger(length) ? length : undefined;
 };
+// The length a body stream still declares: none once a byte has left it (a
+// read, a pipe, a tee), so a forwarded remainder never claims the whole
+// body's length. workerd refuses a stream read from as a body ("This
+// ReadableStream is disturbed"); celld forwards the rest, of no length.
+const __declaredStreamLength = (stream) =>
+  stream._disturbed === true ? undefined : stream._expectedLength;
 // A subrequest body's framing, as the HTTP layer gives it on workerd: a
 // known length is its Content-Length, an unknown one is chunked. Headers
 // that name either are kept, and so is a header list still the wire's own
@@ -233,7 +248,7 @@ const __frameSubrequestBody = (req) => {
   if (req.body === null || req._headersJson !== undefined) return;
   const length = req._bodyBytes !== null
     ? req._bodyBytes.byteLength || undefined
-    : req.body._expectedLength;
+    : __declaredStreamLength(req.body);
   if (req._bodyBytes !== null && length === undefined) return;
   const headers = req.headers;
   if (headers.has("content-length") || headers.has("transfer-encoding")) return;
@@ -260,14 +275,16 @@ class CelldHttpBodyStream extends ReadableStream {
   }
   tee() {
     if (this.locked) throw new TypeError("ReadableStream is locked");
+    // Each branch carries all that is left, as on workerd.
+    const length = __declaredStreamLength(this);
     this._locked = true;
     this._disturbed = true;
     const [left, right] = JSON.parse(
       __http_stream_tee(this.__celldStreamId),
     );
     return [
-      new CelldHttpBodyStream(left),
-      new CelldHttpBodyStream(right),
+      new CelldHttpBodyStream(left, length),
+      new CelldHttpBodyStream(right, length),
     ];
   }
 }
@@ -3679,7 +3696,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
     if (req._bodyBytes === null &&
         !req.headers.has("content-length") &&
         !req.headers.has("transfer-encoding")) {
-      const length = req.body._expectedLength;
+      const length = __declaredStreamLength(req.body);
       if (length === undefined)
         req.headers.set("transfer-encoding", "chunked");
       else req.headers.set("content-length", String(length));
