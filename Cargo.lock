@@ -3828,9 +3828,8 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "v8"
-version = "152.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a10fe1a92da5c32c7c7f838ce36c0ccfcfd5edf0865b58bdde820aa64cea9888"
+version = "158.0.0"
+source = "git+https://github.com/denoland/rusty_v8?rev=d2bc4ef3797288a9686df750671f7ff01e330587#d2bc4ef3797288a9686df750671f7ff01e330587"
 dependencies = [
  "bindgen",
  "bitflags",

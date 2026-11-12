@@ -206,6 +206,8 @@ fn internals_module<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::M
     module
 }
 
+/// Since V8 15.8 a synthetic module's evaluation steps must return a promise
+/// (V8 aborts the process otherwise), so success is a resolved one.
 fn internals_evaluation_steps<'s>(
     context: v8::Local<'s, v8::Context>,
     module: v8::Local<'s, v8::Module>,
@@ -214,7 +216,10 @@ fn internals_evaluation_steps<'s>(
     let internals = internals(scope);
     let default = v8::String::new(scope, "default").unwrap();
     module.set_synthetic_module_export(scope, default, internals.into())?;
-    Some(v8::undefined(scope).into())
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let undefined = v8::undefined(scope).into();
+    resolver.resolve(scope, undefined)?;
+    Some(resolver.get_promise(scope).into())
 }
 
 /// Compile a host-generated stub that imports `celld:internals` and register
