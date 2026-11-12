@@ -5,9 +5,11 @@ A Worker reads a secret of the
 binding: `await env.HOST_SECRET.get()` answers its value. On celld the binding is
 the same, a `Fetcher` whose `get()` answers the value, and the value comes from
 the node's secrets backend, which the node's operator names. The Worker never
-sees the backend, its address or its credentials: they are the node's
-configuration, not the Worker's variables, and the host reads the secret outside
-every isolate.
+sees the backend's credentials: they are the node's configuration, not the
+Worker's variables, and the host reads the secret outside every isolate. A read
+that fails rejects naming the backend and its address (for example "OpenBao at
+https://bao.internal:8200 is not answering"), so its operator can tell why; no
+error names a token or a value.
 
 ## Example
 

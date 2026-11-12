@@ -206,12 +206,24 @@ fn token_from(path: &Path) -> anyhow::Result<String> {
     Ok(token.to_string())
 }
 
-/// A string field of `config`, if present, or why it is refused.
+/// A string field of `config`, if present, or why it is refused. The
+/// refusal names the field and the kind of value it holds, never the value:
+/// the field may be the token.
 fn string_field<'a>(config: &'a serde_json::Map<String, Value>, key: &str) -> anyhow::Result<Option<&'a str>> {
     match config.get(key) {
         None => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
-        Some(other) => bail!("{VARIABLE}'s `{key}` is a string, not {other}"),
+        Some(other) => {
+            let kind = match other {
+                Value::Null => "null",
+                Value::Bool(_) => "true or false",
+                Value::Number(_) => "a number",
+                Value::Array(_) => "an array",
+                Value::Object(_) => "an object",
+                Value::String(_) => unreachable!("matched above"),
+            };
+            bail!("{VARIABLE}'s `{key}` is a string, not {kind}")
+        }
     }
 }
 

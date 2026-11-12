@@ -275,6 +275,25 @@ fn a_wrong_config_is_refused_saying_what() {
     assert!(Backend::parse(b"not json", Path::new("/s.json")).unwrap_err().to_string().contains("is not JSON"));
 }
 
+// Goal: a field of the wrong kind is refused naming the field and the kind
+// of value, never the value: a malformed token stays out of every log.
+#[test]
+fn a_malformed_credential_is_refused_without_its_value() {
+    let secret = "s.review-dummy-credential";
+    let cases = [
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token": [secret] }), "`token` is a string, not an array"),
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token": { "id": secret } }), "`token` is a string, not an object"),
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token_file": [secret] }), "`token_file` is a string, not an array"),
+        (json!({ "backend": [secret] }), "`backend` is a string, not an array"),
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token": 7 }), "`token` is a string, not a number"),
+    ];
+    for (config, says) in &cases {
+        let e = format!("{:#}", Backend::parse(config.to_string().as_bytes(), Path::new("/s.json")).expect_err(says));
+        assert!(e.contains(says), "{says:?} in {e:?}");
+        assert!(!e.contains(secret), "no credential in {e:?}");
+    }
+}
+
 // Goal: a vars backend answers its values by name; an unknown secret
 // rejects (missing), as workerd's binding does; vars is `celld dev`'s alone.
 #[tokio::test(flavor = "multi_thread")]
