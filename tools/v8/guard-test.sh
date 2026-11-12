@@ -6,8 +6,9 @@
 #     build script accepts it (a mirror or URL serving a binding with a marker
 #     line added, as an attacker's would);
 #   - pins from the environment are ignored;
-#   - a poisoned binding in the extracted v8 crate is never compiled: the v8
-#     crate compiles the repository's binding (.cargo/v8/);
+#   - a poisoned binding in the extracted v8 crate (its registry source, or
+#     its git checkout, which ships none) is never compiled: the v8 crate
+#     compiles the repository's binding (.cargo/v8/);
 #   - a changed repository binding fails the build, naming it, and passes
 #     once restored.
 #
@@ -25,7 +26,6 @@ WORK=${CELLD_GUARD_WORK:-$ROOT/target/guard-test}
 TARGET=$(rustc -vV | sed -n 's/^host: //p')
 BINDING="src_binding_release_${TARGET}.rs"
 PINNED="$ROOT/.cargo/v8/$BINDING"
-crate=$(awk '/^name = "v8"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$ROOT/Cargo.lock")
 home="$WORK/cargo-home"
 attack="$WORK/attack"
 
@@ -52,8 +52,17 @@ compiled() {
   out=$(find "$CARGO_TARGET_DIR/lab/build" -path '*/v8-*/output' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2)
   sed -n 's/^cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH=//p' "$out"
 }
-# The copy in the extracted crate, which the v8 build script writes for a mirror.
-extracted() { find "$home/registry/src" -path "*/v8-$crate/gen/$BINDING" 2>/dev/null | head -1; }
+# The copy in the extracted crate, which the v8 build script writes for a
+# mirror: in its registry source, or in its git checkout when Cargo.toml
+# patches v8 from git (a checkout ships no binding, so it may be absent).
+extracted() {
+  local manifest
+  manifest=$(cd "$ROOT" && cargo metadata --locked --format-version 1 |
+    python3 -I -c 'import json, sys; print(next(p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "v8"))')
+  echo "$(dirname "$manifest")/gen/$BINDING"
+}
+# A file's SHA-256, or "absent".
+state() { if [[ -f $1 ]]; then sha256sum "$1" | cut -d' ' -f1; else echo absent; fi; }
 
 failures=0
 fail() { echo "FAIL  $*"; failures=$((failures + 1)); }
@@ -101,14 +110,20 @@ passes RUSTY_V8_SRC_BINDING_PATH="$attack/evil.rs" CELLD_V8_BINDING_SHA256="$evi
 echo "== a poisoned extracted crate is never compiled"
 # A build of v8 alone with a mirror set (any build sharing this cache can do
 # that): the pinned binding path wins, so nothing is downloaded or written.
-if build v8 RUSTY_V8_MIRROR="$attack/mirror" && cmp -s "$(extracted)" "$attack/pinned.rs"; then
-  echo "ok    v8 built with a mirror set left the extracted binding alone"
+target_binding=$(extracted)
+before=$(state "$target_binding")
+if build v8 RUSTY_V8_MIRROR="$attack/mirror" && [[ $(state "$target_binding") == "$before" ]]; then
+  echo "ok    v8 built with a mirror set left the extracted binding alone ($before)"
 else
-  fail "v8 built with a mirror set: $(tail -1 "$WORK/log"); extracted binding $(sha256sum "$(extracted)" | cut -d' ' -f1)"
+  fail "v8 built with a mirror set: $(tail -1 "$WORK/log"); extracted binding $before, now $(state "$target_binding")"
 fi
-# Poison it by hand, as another tool could.
-echo "// guard-test: tampered" >> "$(extracted)"
-echo "      extracted binding now $(sha256sum "$(extracted)" | cut -d' ' -f1)"
+# Poison it by hand, as another tool could (planting one in a git checkout).
+if [[ ! -f $target_binding ]]; then
+  mkdir -p "$(dirname "$target_binding")"
+  cp "$attack/pinned.rs" "$target_binding"
+fi
+echo "// guard-test: tampered" >> "$target_binding"
+echo "      extracted binding $target_binding now $(state "$target_binding")"
 passes
 
 echo "== a changed repository binding fails, naming it"

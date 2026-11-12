@@ -2,9 +2,12 @@
 # The V8 that celld links: check it, rebuild it, publish it, pin it.
 # The why and the steps are in docs/v8.md.
 #
-#   tools/v8/rusty-v8.sh check            name the newest V8 patch; exit 10 behind, 11 branch out of support
-#   tools/v8/rusty-v8.sh build [V8]       rusty_v8 (the crate version in Cargo.lock) on V8 patch V8, from
-#                                         source in rusty_v8's own checkout (celld's build refuses that)
+#   tools/v8/rusty-v8.sh check            name the newest V8 patch; exit 10 behind (update can build it),
+#                                         12 behind (denoland/v8 has not carried it yet), 11 branch out
+#                                         of support
+#   tools/v8/rusty-v8.sh build [V8]       rusty_v8 (the crate Cargo.lock locks: a release, or a commit
+#                                         pinned by rev) on V8 patch V8, from source in rusty_v8's own
+#                                         checkout (celld's build refuses that)
 #   tools/v8/rusty-v8.sh verify-local     build and test celld against the local archive (the pin unchanged)
 #   tools/v8/rusty-v8.sh publish          upload the build as a release on $CELLD_V8_REPO, download it, compare
 #   tools/v8/rusty-v8.sh pin              check that the public URL serves the build, then write .cargo/config.toml
@@ -35,6 +38,21 @@ say() { echo "== $*" >&2; }
 # The v8 crate version celld locks; the rusty_v8 tag is v<this>.
 crate_version() {
   awk '/^name = "v8"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$ROOT/Cargo.lock"
+}
+
+# The denoland/rusty_v8 commit celld locks, when Cargo.toml's [patch.crates-io]
+# takes the v8 crate from git by rev (no release has its V8 yet); empty for a
+# crates.io release. A git source with anything but a full commit is refused.
+crate_rev() {
+  local source
+  source=$(awk '/^name = "v8"$/ { getline; getline; print; exit }' "$ROOT/Cargo.lock")
+  case $source in
+    'source = "registry+'*) ;;
+    *) [[ $source =~ ^'source = "git+'"$RUSTY_V8"'?rev='([0-9a-f]{40})#([0-9a-f]{40})'"'$ &&
+          ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]] ||
+         die "Cargo.lock's v8 is neither a crates.io release nor $RUSTY_V8 pinned by rev: $source"
+       echo "${BASH_REMATCH[1]}" ;;
+  esac
 }
 
 # The v8 crate's own binding for $TARGET, on stdout, read from the .crate
@@ -80,9 +98,25 @@ release_v8_version() {
   header_version "$h"
 }
 
+# The V8 version denoland/v8's branch for V8 branch $1 carries, or empty
+# when denoland has no such branch.
+deno_carries() {
+  local header code
+  header=$(mktemp)
+  code=$(curl -sS -o "$header" -w '%{http_code}' \
+    "${DENO_V8/github.com/raw.githubusercontent.com}/$1-lkgr-denoland/include/v8-version.h") || code=failed
+  case $code in
+    200) header_version "$header" ;;
+    404) ;;
+    *) rm -f "$header"; die "can't read denoland/v8 $1-lkgr-denoland (HTTP $code)" ;;
+  esac
+  rm -f "$header"
+}
+
 cmd_check() {
-  local crate ours branch build newest stable extended lag status=0
+  local crate rev ours branch build newest deno stable extended lag status=0
   crate=$(crate_version)
+  rev=$(crate_rev)
   ours=$(pinned CELLD_V8_VERSION)
   [[ -n $ours ]] || ours=$(release_v8_version "$crate")
   is_version "$ours" || die "can't tell which V8 celld links (got '$ours')"
@@ -94,13 +128,23 @@ cmd_check() {
   extended=$(curl -fsS "$CHROMIUMDASH?channel=Extended&platform=Windows&num=1" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[0]["milestone"])')
   # Chrome milestone M ships V8 branch M/10 . M%10 (Chrome 152 is V8 15.2).
   local mine=$(( ${branch%.*} * 10 + ${branch#*.} ))
-  echo "celld links V8 $ours (rusty_v8 $crate, ${RUSTY_V8#https://github.com/})."
+  echo "celld links V8 $ours (rusty_v8 $crate${rev:+ at commit $rev}, ${RUSTY_V8#https://github.com/})."
   echo "Newest patch on V8 $branch: $newest."
   echo "Chrome stable is $stable (V8 $((stable / 10)).$((stable % 10))); extended stable is $extended (V8 $((extended / 10)).$((extended % 10)))."
+  # build carries Deno's patches only onto a V8 whose patched tree
+  # denoland/v8 has, so the patch denoland's branch carries is the newest it
+  # can build today.
+  deno=$(deno_carries "$branch")
+  echo "denoland/v8 $branch-lkgr-denoland carries ${deno:-no $branch}."
   if [[ $newest != "$ours" ]]; then
     lag=$(patch_tags "$build" | awk -v o="$ours" 'f {n++} $0 == o {f = 1} END {print n + 0}')
-    echo "BEHIND: $lag patch(es) on $branch since ours. Run: tools/v8/rusty-v8.sh update $newest"
-    status=10
+    if [[ -n $deno && $deno != "$ours" && $(printf '%s\n' "$ours" "$deno" | sort -V | tail -1) == "$deno" ]]; then
+      echo "BEHIND: $lag patch(es) on $branch since ours. Run: tools/v8/rusty-v8.sh update $deno"
+      status=10
+    else
+      echo "BEHIND: $lag patch(es) on $branch since ours, none of them on denoland/v8 yet; update builds once it carries them (docs/v8.md)."
+      status=12
+    fi
   fi
   if (( mine < extended )); then
     echo "OUT OF SUPPORT: Chrome no longer merges security fixes to V8 $branch (oldest supported is $((extended / 10)).$((extended % 10))). Moving needs a newer rusty_v8: see docs/v8.md."
@@ -130,24 +174,39 @@ for path, dep in scope["deps"].items():
 }
 
 cmd_build() {
-  local crate want src v8 pin base base_version patches branch build
+  local crate commit want src v8 pin base base_version patches branch build
   crate=$(crate_version)
   [[ -n $crate ]] || die "no v8 crate in Cargo.lock"
+  commit=$(crate_rev)
   want=${1:-}
-  src="$WORK/src/rusty_v8-v$crate"
+  src="$WORK/src/rusty_v8-${commit:-v$crate}"
   v8="$src/v8"
 
   if [[ ! -d $src/.git ]]; then
-    say "cloning rusty_v8 v$crate"
+    say "cloning rusty_v8 ${commit:-v$crate}"
     mkdir -p "$WORK/src"
-    git clone -q --depth 1 --branch "v$crate" "$RUSTY_V8" "$src.part"
+    rm -rf "$src.part"
+    if [[ -n $commit ]]; then
+      git init -q "$src.part"
+      git -C "$src.part" remote add origin "$RUSTY_V8"
+      git -C "$src.part" fetch -q --depth 1 origin "$commit"
+      git -C "$src.part" checkout -q --detach "$commit"
+    else
+      git clone -q --depth 1 --branch "v$crate" "$RUSTY_V8" "$src.part"
+    fi
     # v8 needs its patches' history down to the upstream version commit.
     git -C "$src.part" submodule update -q --init --depth 30 v8
     submodule_paths "$src.part" | grep -vx v8 |
       xargs git -C "$src.part" submodule update -q --init --recursive --depth 1 --jobs 8 --
     mv "$src.part" "$src"
   fi
-  [[ $(git -C "$src" describe --tags --exact-match HEAD) == "v$crate" ]] || die "$src is not at v$crate"
+  if [[ -n $commit ]]; then
+    [[ $(git -C "$src" rev-parse HEAD) == "$commit" ]] || die "$src is not at $commit"
+    [[ $(git -C "$src" show HEAD:Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1) == "$crate" ]] ||
+      die "rusty_v8 $commit is not the v8 crate $crate"
+  else
+    [[ $(git -C "$src" describe --tags --exact-match HEAD) == "v$crate" ]] || die "$src is not at v$crate"
+  fi
   [[ -z $(git -C "$src" status --porcelain --untracked-files=no --ignore-submodules=all) ]] || die "$src has local changes"
   # Submodules move only where they must, so a second run rebuilds nothing.
   local sub
@@ -169,7 +228,7 @@ cmd_build() {
   branch=${want%.*.*}
   build=${want%.*}
   [[ ${base_version%.*} == "$build" ]] || die "V8 $want is not on the release's branch build ${base_version%.*}; a different branch needs a different rusty_v8 (docs/v8.md)"
-  say "rusty_v8 v$crate: V8 $base_version + ${#patches[@]} Deno patches -> $want"
+  say "rusty_v8 v$crate${commit:+ at $commit}: V8 $base_version + ${#patches[@]} Deno patches -> $want"
   git -C "$v8" fetch -q --depth 1 "$CHROMIUM_V8" "+refs/tags/$want:refs/tags/$want"
   git -C "$v8" fetch -q --depth 1 "$CHROMIUM_V8" "+refs/tags/$base_version:refs/tags/$base_version"
   [[ $(git -C "$v8" rev-parse "$base_version^{commit}") == "$base" ]] || die "the release's base is not upstream's $base_version"
@@ -241,10 +300,12 @@ cmd_build() {
   cp "$out/src_binding.rs" "$dist/$BINDING"
   grep -aq "$want" "$out/obj/librusty_v8.a" || die "the archive does not carry the string $want"
 
-  # celld compiles the crate's own (checksummed) binding. bindgen makes it
-  # from V8's public headers and rusty_v8's sources, so it fits this archive
-  # when those are the release's but for the patch level. (The generated
-  # file varies with the host's libclang, so it is published, not compared.)
+  # For a release, celld compiles the crate's own (checksummed) binding; for
+  # a commit, which has no .crate, the one generated here. bindgen makes it
+  # from V8's public headers and rusty_v8's sources, and the crate's Rust
+  # code was written against those headers, so both fit this archive when
+  # the headers are the crate's but for the patch level. (The generated file
+  # varies with the host's libclang, so it is published, not compared.)
   local headers
   headers=$(git -C "$v8" diff --name-only "$pin" HEAD -- include/)
   [[ -z $headers || $headers == include/v8-version.h ]] || die "V8's public headers changed: ${headers//$'\n'/ }; the crate's binding may not fit"
@@ -254,7 +315,11 @@ cmd_build() {
   say "V8's public headers are the release's but for V8_PATCH_LEVEL"
 
   {
-    echo "rusty_v8: v$crate ($RUSTY_V8)"
+    if [[ -n $commit ]]; then
+      echo "rusty_v8: v$crate ($RUSTY_V8 commit $commit, unreleased)"
+    else
+      echo "rusty_v8: v$crate ($RUSTY_V8)"
+    fi
     echo "V8: $want (upstream $CHROMIUM_V8 tag $want, $(git -C "$v8" rev-parse "$want^{commit}"))"
     echo "V8 with Deno's patches: $(git -C "$v8" rev-parse HEAD) (tree $ours_tree)"
     echo "Deno patches, carried from the release's V8 $pin on $base_version:"
@@ -281,23 +346,35 @@ dist_dir() {
 }
 dist_v8() { sed -n 's/^V8: \([0-9.]*\) .*/\1/p' "$1/BUILDINFO"; }
 dist_crate() { sed -n 's/^rusty_v8: v\([0-9.]*\) .*/\1/p' "$1/BUILDINFO"; }
+dist_rev() { sed -n 's/^rusty_v8: v[0-9.]* (.* commit \([0-9a-f]\{40\}\), unreleased)$/\1/p' "$1/BUILDINFO"; }
 tag_for() { echo "rusty_v8-v$1-v8-$2"; }
 
 cmd_pin() {
-  local dist crate v8 sha url check binding_sha
+  local dist crate rev built v8 sha url check binding_sha
   dist=$(dist_dir)
   crate=$(dist_crate "$dist")
+  rev=$(crate_rev)
+  built=$(dist_rev "$dist")
   v8=$(dist_v8 "$dist")
   [[ $crate == "$(crate_version)" ]] || die "the build is rusty_v8 $crate, Cargo.lock has $(crate_version)"
+  [[ $built == "$rev" ]] || die "the build is rusty_v8 ${built:-v$crate}, Cargo.lock has ${rev:-v$crate}"
   sha=$(sha256sum "$dist/$ARCHIVE" | cut -d' ' -f1)
   url="https://github.com/$REPO/releases/download/$(tag_for "$crate" "$v8")/$ARCHIVE"
   # Only what the public URL serves is pinned, so the round trip comes first.
   check=$(mktemp -d)
   curl -fsSL --retry 3 -o "$check/$ARCHIVE" "$url" || die "$url is not published; run publish first"
   [[ $(sha256sum "$check/$ARCHIVE" | cut -d' ' -f1) == "$sha" ]] || die "$url does not serve this build"
-  rm -rf "$check"
   mkdir -p "$(dirname "$CONFIG")/v8"
-  crate_binding "$crate" > "$(dirname "$CONFIG")/v8/$BINDING.part"
+  if [[ -n $rev ]]; then
+    # A commit has no .crate, so its binding is the one this build generated,
+    # as the release publishes it.
+    curl -fsSL --retry 3 -o "$check/$BINDING" "${url%/*}/$BINDING" || die "${url%/*}/$BINDING is not published"
+    cmp -s "$check/$BINDING" "$dist/$BINDING" || die "${url%/*}/$BINDING is not this build's binding"
+    cp "$check/$BINDING" "$(dirname "$CONFIG")/v8/$BINDING.part"
+  else
+    crate_binding "$crate" > "$(dirname "$CONFIG")/v8/$BINDING.part"
+  fi
+  rm -rf "$check"
   mv "$(dirname "$CONFIG")/v8/$BINDING.part" "$(dirname "$CONFIG")/v8/$BINDING"
   binding_sha=$(sha256sum "$(dirname "$CONFIG")/v8/$BINDING" | cut -d' ' -f1)
   cat > "$CONFIG" <<EOF
@@ -306,8 +383,9 @@ cmd_pin() {
 #
 # The v8 build script fetches RUSTY_V8_ARCHIVE and checks it against
 # RUSTY_V8_ARCHIVE_SHA256 before use. It compiles the binding at
-# RUSTY_V8_SRC_BINDING_PATH, the crate's own (from the .crate Cargo.lock
-# checks) kept here in v8/, and neither downloads nor writes one.
+# RUSTY_V8_SRC_BINDING_PATH, kept here in v8/ (the crate's own, from the
+# .crate Cargo.lock checks; for a crate pinned by git rev, which has none,
+# the one the archive's build generated), and neither downloads nor writes one.
 # crates/celld/build.rs checks that file against CELLD_V8_BINDING_SHA256,
 # refuses the variables that would bring other V8 code in (a binding mirror
 # or URL; trybuild; a source or debug build), and any target but $TARGET,
@@ -320,19 +398,22 @@ RUSTY_V8_SRC_BINDING_PATH = { value = ".cargo/v8/$BINDING", relative = true, for
 CELLD_V8_BINDING_SHA256 = { value = "$binding_sha", force = true }
 RUSTY_V8_SKIP_DOWNLOAD = { value = "0", force = true }
 EOF
-  say "pinned V8 $v8: $url sha256 $sha; the crate's binding sha256 $binding_sha"
+  say "pinned V8 $v8: $url sha256 $sha; the binding sha256 $binding_sha"
 }
 
 # Build celld and run its tests: against the pin, or against an archive,
-# its SHA-256 and its V8 version ($1..$3), given as cargo --config
-# overrides, which outrank the forced pin without changing it.
+# its SHA-256, its V8 version and the binding that goes with it ($1..$4),
+# given as cargo --config overrides, which outrank the forced pin without
+# changing it.
 celld_test() {
   local target_dir=${CELLD_TARGET_DIR:-$ROOT/target} over=() version v
   version=$(pinned CELLD_V8_VERSION)
-  if (( $# == 3 )); then
+  if (( $# == 4 )); then
     over=(--config "env.RUSTY_V8_ARCHIVE.value=\"$1\"" \
       --config "env.RUSTY_V8_ARCHIVE_SHA256.value=\"$2\"" \
-      --config "env.CELLD_V8_VERSION.value=\"$3\"")
+      --config "env.CELLD_V8_VERSION.value=\"$3\"" \
+      --config "env.RUSTY_V8_SRC_BINDING_PATH.value=\"$4\"" \
+      --config "env.CELLD_V8_BINDING_SHA256.value=\"$(sha256sum "$4" | cut -d' ' -f1)\"")
     version=$3
   fi
   (cd "$ROOT" && CARGO_TARGET_DIR="$target_dir" cargo "${over[@]}" test --profile lab --locked -j "$JOBS")
@@ -342,9 +423,16 @@ celld_test() {
 }
 
 cmd_verify_local() {
-  local dist
+  local dist binding
   dist=$(dist_dir)
-  celld_test "$dist/$ARCHIVE" "$(sha256sum "$dist/$ARCHIVE" | cut -d' ' -f1)" "$(dist_v8 "$dist")"
+  # The binding pin will write: the build's for a commit, else the crate's.
+  binding=$dist/$BINDING
+  if [[ -z $(crate_rev) ]]; then
+    mkdir -p "$dist/crate"
+    binding=$dist/crate/$BINDING
+    crate_binding "$(crate_version)" > "$binding"
+  fi
+  celld_test "$dist/$ARCHIVE" "$(sha256sum "$dist/$ARCHIVE" | cut -d' ' -f1)" "$(dist_v8 "$dist")" "$binding"
 }
 
 cmd_publish() {

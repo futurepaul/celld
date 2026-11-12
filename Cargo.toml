@@ -157,9 +157,15 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 urlpattern = "=0.4.2"
-# Shared isolates need v8::Locker and Send Globals:
-# denoland/rusty_v8#2044 and #2045. Both ship in 152.1.0, so this is an
-# ordinary dependency again — no path override, and no hand-built archive.
-v8 = "152.1"
+# V8 15.8. No v8 release carries it yet, so [patch.crates-io] below takes the
+# crate from denoland/rusty_v8's commit for the roll (docs/v8.md).
+v8 = "158.0.0"
 # 1.0.10 drops the emSign ECC root, whose intermediate CA keys are public.
 webpki-roots = "1.0.10"
+
+[patch.crates-io]
+# denoland/rusty_v8#2098, "Rolling to V8 15.8.62.23", unreleased. Pinned by
+# rev, never a branch: Cargo.lock records this commit, and
+# tools/v8/rusty-v8.sh refuses a v8 from git by anything else. Remove this
+# once a v8 158 release is on crates.io (docs/v8.md).
+v8 = { git = "https://github.com/denoland/rusty_v8", rev = "d2bc4ef3797288a9686df750671f7ff01e330587" }

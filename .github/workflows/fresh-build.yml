@@ -36,7 +36,7 @@ jobs:
           rustup default "$RUST_VERSION"
           home=${CARGO_HOME:-$HOME/.cargo}
           rm -rf "$home/registry" "$home/git"
-          echo "CARGO_REGISTRY_SRC=$home/registry/src" >> "$GITHUB_ENV"
+          echo "CARGO_HOME_DIR=$home" >> "$GITHUB_ENV"
 
       - name: Build celld
         run: cargo build --locked -p celld
@@ -50,8 +50,17 @@ jobs:
       - name: A poisoned extracted crate is never compiled
         run: |
           set -euo pipefail
-          extracted=$(find "$CARGO_REGISTRY_SRC" -path '*/v8-*/gen/src_binding_release_x86_64-unknown-linux-gnu.rs' | head -1)
-          test -n "$extracted"
+          # The v8 crate's extracted source: its registry source, or its git
+          # checkout when Cargo.toml patches v8 from git (which ships no
+          # binding, so one is planted).
+          manifest=$(cargo metadata --locked --format-version 1 |
+            python3 -I -c 'import json, sys; print(next(p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "v8"))')
+          extracted=$(dirname "$manifest")/gen/src_binding_release_x86_64-unknown-linux-gnu.rs
+          case $extracted in "$CARGO_HOME_DIR"/*) ;; *) echo "::error::v8 is not extracted under $CARGO_HOME_DIR: $extracted"; exit 1 ;; esac
+          if [ ! -f "$extracted" ]; then
+            mkdir -p "$(dirname "$extracted")"
+            cp .cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs "$extracted"
+          fi
           echo "// fresh-build: tampered" >> "$extracted"
           cargo build --locked -p celld
           grep -h '^cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH=' target/debug/build/v8-*/output |
