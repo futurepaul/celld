@@ -56,8 +56,27 @@ async function text(stream) {
 }
 
 export class Conformance extends DurableObject {
-  async fetch() {
+  async fetch(request) {
     const c = this.ctx.container;
+    // A monitor() set by an event that then answers: the container's exit
+    // settles it later all the same (`monitor_after_its_event`).
+    const step = new URL(request.url).pathname;
+    if (step === "/monitor/start") {
+      await this.ctx.storage.delete("ended");
+      c.start({ image: c.images.base, enableInternet: false });
+      c.monitor().then(
+        () => this.ctx.storage.put("ended", "resolved"),
+        (error) => this.ctx.storage.put("ended", `exit ${error.exitCode}`),
+      );
+      return new Response("started");
+    }
+    if (step === "/monitor/kill") {
+      c.signal(9);
+      return new Response("killed");
+    }
+    if (step === "/monitor/ended") {
+      return Response.json({ ended: (await this.ctx.storage.get("ended")) ?? null, running: c.running });
+    }
     const results = {};
     // Each check has a budget, so one that hangs is a failure, not a hung
     // suite.
@@ -323,6 +342,30 @@ export default {
     const url = new URL(request.url);
     if (url.pathname !== "/run") return new Response("GET /run", { status: 404 });
     const name = url.searchParams.get("id") ?? `run-${Date.now()}`;
-    return env.CONFORMANCE.get(env.CONFORMANCE.idFromName(name)).fetch(request);
+    const answer = await env.CONFORMANCE.get(env.CONFORMANCE.idFromName(name)).fetch(request);
+    const verdict = await answer.json();
+    // Each step its own event on a fresh object: the monitor() was set by an
+    // event that answered before the container was killed.
+    const t0 = Date.now();
+    const box = env.CONFORMANCE.get(env.CONFORMANCE.idFromName(`${name}-monitor`));
+    const step = (path) => box.fetch(`http://conformance${path}`);
+    let result;
+    try {
+      await step("/monitor/start");
+      await sleep(5000);
+      await step("/monitor/kill");
+      const ended = await within(30000, "the exit settles monitor()", async () => {
+        const seen = await (await step("/monitor/ended")).json();
+        return seen.ended === null ? undefined : seen;
+      });
+      result = ended.ended === "exit 137"
+        ? { ok: true, ms: Date.now() - t0, detail: ended }
+        : { ok: false, ms: Date.now() - t0, error: `expected: ${JSON.stringify(ended)}` };
+    } catch (error) {
+      result = { ok: false, ms: Date.now() - t0, error: error?.message ?? String(error) };
+    }
+    verdict.results.monitor_after_its_event = result;
+    verdict.summary[result.ok ? "passed" : "failed"] += 1;
+    return Response.json(verdict);
   },
 };

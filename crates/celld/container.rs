@@ -445,6 +445,19 @@ impl CellContainer {
         self.state.lock().unwrap().run
     }
 
+    /// fork: how run `run` ended, once it has, as `monitor()` reads it: its
+    /// exit, or `Err` for an engine failure the wait could not attribute;
+    /// for a run a later start replaced (which drops its exit), `Err`
+    /// saying so. `None` while it runs.
+    pub fn ended(&self, run: u64) -> Option<Result<RunExit, String>> {
+        if let Some((ended, result)) = self.exit.borrow().clone() {
+            if ended >= run {
+                return Some(result);
+            }
+        }
+        (self.current_run() > run).then(|| Err("a later start replaced this run".to_string()))
+    }
+
     /// `inspect()`: the running container's image and labels, or `None`.
     /// The image is empty while it starts and when it came from a snapshot,
     /// as on Cloudflare.

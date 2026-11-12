@@ -2615,6 +2615,12 @@ class Container {
   constructor(scope) {
     this._scope = scope;
     this._destroyReason = undefined;
+    // fork: each monitor() not yet settled, with the run it waits on. Its
+    // op settles it while the event that called it lives; an op goes with
+    // its event (it cannot keep the object alive), so the object's next
+    // event settles the rest whose run ended (`_settleEnded`), as Cloudflare
+    // settles monitor() when the container stops, whatever event runs.
+    this._watching = [];
   }
   // The host's answer, not a JavaScript flag: a monitor() promise can be
   // dropped with its event, so the flag it would maintain could go stale.
@@ -2695,26 +2701,41 @@ class Container {
   async monitor() {
     if (!this.running)
       throw new Error("monitor() cannot be called on a container that is not running.");
-    let raw;
-    try {
-      raw = await __container_monitor(this._scope);
-    } catch (error) {
-      this._destroyReason = undefined;
-      throw error;
-    }
-    const { code, destroyed } = JSON.parse(raw);
+    const run = __container_run(this._scope);
+    return new Promise((resolve, reject) => {
+      const watch = { run, resolve, reject };
+      this._watching.push(watch);
+      __container_monitor(this._scope).then(
+        (raw) => this._settle(watch, JSON.parse(raw)),
+        (error) => this._settle(watch, { thrown: error }),
+      );
+    });
+  }
+  // One monitor() settled, once, by how its run ended.
+  _settle(watch, ended) {
+    const at = this._watching.indexOf(watch);
+    if (at < 0) return;
+    this._watching.splice(at, 1);
     const reason = this._destroyReason;
     this._destroyReason = undefined;
+    if (ended.thrown !== undefined) return watch.reject(ended.thrown);
+    if (ended.error !== undefined) return watch.reject(new Error(ended.error));
     // destroy() ends a run cleanly unless it was given an error.
-    if (destroyed) {
-      if (reason !== undefined) throw reason;
-      return;
+    if (ended.destroyed) return reason !== undefined ? watch.reject(reason) : watch.resolve();
+    if (reason !== undefined) return watch.reject(reason);
+    if (ended.code !== 0) {
+      const error = new Error(`Container exited with unexpected exit code: ${ended.code}`);
+      error.exitCode = ended.code;
+      return watch.reject(error);
     }
-    if (reason !== undefined) throw reason;
-    if (code !== 0) {
-      const error = new Error(`Container exited with unexpected exit code: ${code}`);
-      error.exitCode = code;
-      throw error;
+    watch.resolve();
+  }
+  // fork: the monitor() promises whose run the host says ended, settled
+  // in the event now running (`_readyInstance`).
+  _settleEnded() {
+    for (const watch of [...this._watching]) {
+      const raw = __container_ended(this._scope, watch.run);
+      if (raw !== null) this._settle(watch, JSON.parse(raw));
     }
   }
   async destroy(error) {
@@ -3165,6 +3186,9 @@ function _instance(scope) {
 async function _readyInstance(scope) {
   const inst = _instance(scope);
   await inst.__celldState._ready();
+  // fork: a container's exit that no live event heard reaches its monitor()
+  // now, in this event (Container._settleEnded)
+  inst.__celldState.container?._settleEnded();
   return inst;
 }
 const __actorEventStack = [];
