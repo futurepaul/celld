@@ -240,6 +240,11 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
              CELLD_INTERNAL_ADDR; the default internal listener uses a random loopback port"
         );
     }
+    // A file of secret values is `celld dev`'s alone; a node of a fleet
+    // reads OpenBao (secrets.rs).
+    if !diagnose {
+        celld::secrets::check_node(settings.dev_store.is_some())?;
+    }
     if settings.dev_store.is_some() {
         anyhow::ensure!(
             !settings.control_plane

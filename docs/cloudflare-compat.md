@@ -27,10 +27,13 @@ An unsupported feature that does not cause an error is a defect.
 | [D1](services/d1.md) | **Yes** |
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
-| Workers AI | **No** |
+| [Secrets Store](services/secrets-store.md) | **Yes** — read from the node's OpenBao (or Vault), or a `celld dev` file |
+| Workers AI | **No** — an `ai` binding is bound, and its calls reject ([stand-ins](#services-a-node-does-not-run)) |
 | Vectorize | **No** |
 | Hyperdrive | **No** |
-| Browser Rendering | **No** |
+| Browser Rendering | **No** — a `browser` binding is bound, and its calls reject ([stand-ins](#services-a-node-does-not-run)) |
+| Images | **No** — an `images` binding is bound, and its calls reject ([stand-ins](#services-a-node-does-not-run)) |
+| Email Sending | **No** — a `send_email` binding is bound, and its sends reject ([stand-ins](#services-a-node-does-not-run)) |
 | Email Workers | **No** |
 | [Python Workers](services/workers.md#python-workers) | **Partial** — `fetch` handlers on the Pyodide 0.28 runtime line |
 
@@ -78,6 +81,31 @@ An unsupported feature that does not cause an error is a defect.
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
 Only the binding types in the [services table](#services) are available.
+
+Each binding's class has workerd's name, because SDKs tell a binding by
+`constructor.name` (workers-rs's `EnvBinding` refuses one whose name is not its
+type's): `DurableObjectNamespace`, `R2Bucket`, `D1Database`, `KvNamespace`,
+`WorkerQueue`, `WorkflowImpl`, `WorkerLoader`, and `Fetcher` for static assets,
+service bindings, Secrets Store secrets and Browser Rendering. A service
+binding's prototype is `ServiceStub`'s, as before; its `constructor` is
+`Fetcher`.
+
+#### Services a node does not run
+
+A config may bind `send_email`, `images`, `browser` and `ai`, as a Worker written
+for Cloudflare does. celld binds each with workerd's class (`SendEmail`,
+`ImagesBindingImpl`, `Fetcher`, `Ai`), and every call rejects, saying so:
+
+- `SendEmail.send()` rejects as Email Sending rejects a message it does not
+  send, with `code` `E_NO_MAILER` and the message "this node has no mailer". A
+  node's own mailer (SMTP relaying) is a later change, and it plugs in there.
+- `IMAGES.input()` answers a transformer at once, whose `output()` rejects "this
+  node has no Images"; so does `info()`.
+- `BROWSER.fetch()` rejects "this node has no Browser Rendering".
+- `AI.run()` rejects "this node has no Workers AI".
+
+The deploy requires the `service-stand-ins-v1` feature, so a node that predates
+them refuses it.
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 

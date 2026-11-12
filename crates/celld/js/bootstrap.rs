@@ -481,6 +481,9 @@ pub(super) fn inject_containers(
     containers: &[crate::container::ContainerSpec],
 ) -> Result<()> {
     let cell = cell_state(scope)?;
+    let key = v8::String::new(scope, "containerEngine").unwrap();
+    let engine = v8::Boolean::new(scope, crate::container::runs_containers());
+    cell.set(scope, key.into(), engine.into());
     let map = v8::Object::new(scope);
     for spec in containers {
         let key =
@@ -675,6 +678,9 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",
                 name, script_name
             ));
+        }
+        for (name, stand_in) in &config.stand_ins {
+            lines.push_str(&format!("e[{:?}] = {};\n", name, stand_in.maker()));
         }
         // One `__makeLoader()` call for each binding. Each call builds its own
         // `byName` cache, so two loaders are two namespaces, as they are in

@@ -57,6 +57,11 @@ pub struct Dev {
 
 impl Dev {
     pub fn start(project: &Path) -> Dev {
+        Dev::start_with(project, &[])
+    }
+
+    /// One `celld dev` with `env` set beside the defaults.
+    pub fn start_with(project: &Path, env: &[(&str, &str)]) -> Dev {
         let port = free_port();
         let mut child = Command::new(env!("CARGO_BIN_EXE_celld"))
             .arg("dev")
@@ -64,6 +69,7 @@ impl Dev {
             .args(["--port", &port.to_string(), "--no-watch", "--logs"])
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

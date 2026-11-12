@@ -74,6 +74,8 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
     FEATURE_PYTHON_WORKERS_V1,
+    FEATURE_SECRETS_STORE_V1,
+    FEATURE_SERVICE_STAND_INS_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -119,6 +121,17 @@ pub const FEATURE_KV_V1: &str = "kv-v1";
 /// A deployment with a Queue producer or consumer. A node without the broker
 /// would otherwise omit a producer binding or silently stop consuming.
 pub const FEATURE_QUEUES_V1: &str = "queues-v1";
+
+/// A deployment with `secrets_store_secrets` bindings. A node without them
+/// would build an `env` missing each secret, and the Worker would find it
+/// unbound at its first read.
+pub const FEATURE_SECRETS_STORE_V1: &str = "secrets-store-v1";
+
+/// A deployment binding `send_email`, `images`, `browser` or `ai`, which a
+/// node binds with workerd's classes, every call rejecting. A node without
+/// them would build an `env` missing the binding (or, for `ai`, refuse the
+/// deployment at load).
+pub const FEATURE_SERVICE_STAND_INS_V1: &str = "service-stand-ins-v1";
 
 pub const QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
 

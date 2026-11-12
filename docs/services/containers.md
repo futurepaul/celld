@@ -89,6 +89,13 @@ engine.
 container API itself (fragment's `sandcastle-engine`). Its `ports.sock` is in
 the same directory.
 
+`none` says the node runs no container. A deployment may still declare
+`containers`, as a Worker written for Cloudflare does: a container class's
+objects activate, each with a `ctx.container` that is not running, whose
+`images` is empty and whose `start()` throws "this node runs no computers". A
+deploy made under `none` builds, pulls and saves no image, and carries no fence
+image.
+
 On the krun engine, each container is a virtual machine in its own jail, cgroup,
 and network namespace, so the engine and not a node-wide fence enforces
 `enableInternet`, and a deployment for krun nodes carries no fence image. The

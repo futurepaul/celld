@@ -785,12 +785,6 @@ async fn load_worker_at_pointer(
     }
     crate::protocol::validate_required_features(&manifest.required_features)?;
     crate::protocol::validate_queue_manifest(&manifest)?;
-    // Old managed uploads can contain AI metadata without a required-feature
-    // gate. Refuse it before loading code, rather than serve a missing binding.
-    anyhow::ensure!(
-        bindings(&manifest, "ai").next().is_none(),
-        "AI bindings are not supported; call the provider from application code"
-    );
     let prefix = &pointer.prefix;
     let mut fetched =
         futures_util::future::try_join_all(manifest.modules.iter().map(|module| async move {
@@ -905,6 +899,16 @@ async fn load_worker_at_pointer(
         .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
         .collect();
     let services = service_bindings(&manifest);
+    // fork: the bindings of services a node does not run (`ai` among them:
+    // bound, every call rejecting, where it was refused before).
+    let stand_ins = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|binding| crate::js::StandIn::from_metadata(binding).transpose())
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let vars = worker_vars(&manifest);
     let compat = crate::worker_compat(&manifest.raw_metadata);
     let assets = match &manifest.assets {
@@ -962,6 +966,7 @@ async fn load_worker_at_pointer(
         loader_bindings,
         assets,
         services,
+        stand_ins,
         crons,
         containers,
         fence_image,
@@ -980,6 +985,8 @@ pub struct LoadedDeployment {
     pub loader_bindings: Vec<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
+    /// fork: bindings of the Cloudflare services a node does not run.
+    pub stand_ins: Vec<(String, crate::js::StandIn)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
     /// `containers` from the manifest: the classes whose cells supervise a

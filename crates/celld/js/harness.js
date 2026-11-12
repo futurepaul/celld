@@ -810,7 +810,110 @@ const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
   response.url = req.url;
   return response;
 };
-__celld.__makeAssetsBinding = (script) => ({
+// ---- Binding classes ------------------------------------------------------
+// Each binding's class has workerd's name, because SDKs tell a binding by
+// `constructor.name`: workers-rs's `EnvBinding::get` takes one only when the
+// name is its type's (`R2Bucket`, `Fetcher`, `SendEmail`, `Ai`,
+// `WorkerQueue`, `DurableObjectNamespace`, `D1Database`) and refuses it
+// otherwise ("Binding cannot be cast to the type R2Bucket from Object"). A
+// binding the harness builds as an object literal takes its class's
+// prototype here; its methods stay its own.
+//
+// `Fetcher` is workerd's class for every binding that answers a request or
+// an RPC call of another service: static assets, a service binding, a
+// Secrets Store secret, Browser Rendering.
+class Fetcher {}
+class R2Bucket {}
+class WorkerLoader {}
+const __named = (cls, binding) => Object.setPrototypeOf(binding, cls.prototype);
+
+// ---- Services this node does not have --------------------------------------
+// A config may bind `send_email`, `images`, `browser` and `ai` (a Worker
+// written for Cloudflare does), and the binding is there, with workerd's
+// class, as on Cloudflare. This node has none of those services, so every
+// call rejects, saying which; a Worker that can do without one catches it,
+// as it catches the service's own failures.
+const __noService = (service) => new Error(`this node has no ${service}`);
+
+// `send_email`: every send rejects as Email Sending rejects a message it
+// does not send, with `{code, message}`. A node's mailer (SMTP relaying) is
+// a later change, and it plugs in here: the node's config names it, as it
+// names the secrets backend, and `send()` hands it the message.
+class SendEmail {
+  async send(_message) {
+    const error = new Error("this node has no mailer");
+    error.code = "E_NO_MAILER";
+    throw error;
+  }
+}
+
+// `images`: `input()` answers a transformer at once, as Images does, and
+// its `output()` rejects; so does `info()`. The input stream is let go.
+const __letGo = async (stream) => {
+  try {
+    await stream?.cancel?.();
+  } catch {
+    // a stream already read or locked: nothing to let go
+  }
+};
+class __NoImageTransformer {
+  constructor(stream) {
+    Object.defineProperty(this, "_stream", { value: stream });
+  }
+  transform(_options) { return this; }
+  draw(_image, _options) { return this; }
+  async output(_options) {
+    await __letGo(this._stream);
+    throw __noService("Images");
+  }
+}
+class ImagesBindingImpl {
+  input(stream) {
+    return new __NoImageTransformer(stream);
+  }
+  async info(stream) {
+    await __letGo(stream);
+    throw __noService("Images");
+  }
+}
+
+// `ai`: Workers AI.
+class Ai {
+  async run(_model, _inputs, _options) {
+    throw __noService("Workers AI");
+  }
+}
+
+__celld.__makeSendEmail = () => new SendEmail();
+__celld.__makeImages = () => new ImagesBindingImpl();
+__celld.__makeAi = () => new Ai();
+// `browser`: a `Fetcher`, as wrangler binds Browser Rendering.
+__celld.__makeBrowser = () => __named(Fetcher, {
+  async fetch(_input, _init) {
+    throw __noService("Browser Rendering");
+  },
+});
+
+// `secrets_store_secrets`: a `Fetcher` whose `get()` answers the secret
+// `secretName` from the node's secrets backend (`CELLD_SECRETS_FILE`,
+// secrets.rs), as the Secrets Store's binding answers it. The backend and
+// its credentials are the node's and the host holds them: no token or
+// address is in this isolate, and the host reads only through this op. A
+// read that fails rejects with an Error whose `code` says why: `unbound`
+// (this node names no backend), `missing` (no such secret, which workerd
+// rejects too), `refused`, `sealed`, `down`, `failed` or `malformed`.
+__celld.__makeSecretsStoreSecret = (secretName) => __named(Fetcher, {
+  async get() {
+    const answer = JSON.parse(await __secret_get(secretName));
+    if (answer.code === undefined) return answer.value;
+    const error = new Error(answer.message);
+    error.name = "SecretsError";
+    error.code = answer.code;
+    throw error;
+  },
+});
+
+__celld.__makeAssetsBinding = (script) => __named(Fetcher, {
   async fetch(input, init) {
     const req = input instanceof Request ? new Request(input, init) : new Request(input, init);
     const r = JSON.parse(await __asset_fetch(
@@ -1173,7 +1276,7 @@ const __r2Multipart = (binding, bucketName, key, id) => ({
     await __r2_mp_abort(await id.host);
   },
 });
-__celld.__makeR2Bucket = (binding, bucketName) => ({
+__celld.__makeR2Bucket = (binding, bucketName) => __named(R2Bucket, {
   async head(key) {
     const name = __r2Key(binding, "head", key);
     const r = JSON.parse(await __r2_head(bucketName, name));
@@ -2521,6 +2624,10 @@ class Container {
     return Object.freeze(JSON.parse(__container_images(this._scope)));
   }
   start(options) {
+    // a node with no engine (`CELLD_CONTAINER_ENGINE=none`) runs no
+    // container: its objects find theirs not running, and a start throws
+    if (!__cell.containerEngine)
+      throw new Error("this node runs no computers");
     if (this.running)
       throw new Error("start() cannot be called on a container that is already running.");
     const o = options ?? {};
@@ -3677,7 +3784,7 @@ __celld.__makeLoader = () => {
           envRoutes, tails.length !== 0);
         return { id, tails };
       });
-  return {
+  return __named(WorkerLoader, {
     load(code) { return makeStub(track(loadFrom(() => code))); },
     get(name, getCode) {
       let ref = byName.get(name);
@@ -3690,12 +3797,12 @@ __celld.__makeLoader = () => {
       }
       return makeStub(loadPromise, name, ref);
     },
-  };
+  });
 };
 
 const __makeServiceBinding = __celld.__makeServiceBinding =
   (script, entrypoint = null, propsSc = undefined) => {
-  const target = {
+  const target = __named(Fetcher, {
   async fetch(input, init) {
     const req = new Request(input, init);
     const signal = req._signalForSubrequests;
@@ -3809,7 +3916,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
       if (drain !== null) await drain;
     }
   },
-  };
+  });
   // An omitted entrypoint selects the module's default export, which may be a
   // WorkerEntrypoint or an object handler. `entrypoint = "Name"` selects that
   // named class. Any property other than a reserved Fetcher method is an
@@ -6160,6 +6267,10 @@ const __cell = __celld.__cell = {
   crons: [],
   workflows: {},
   containers: {},
+  // Whether this node has a container engine (`CELLD_CONTAINER_ENGINE` is
+  // not `none`): without one, a container class's objects still have their
+  // `ctx.container`, which never runs.
+  containerEngine: true,
   instances: {},
   facetConfigs: {},
   env: {},
@@ -7689,7 +7800,7 @@ class __QueueCell {
 
 __runtimeClass("__Queue", __QueueCell);
 
-class Queue {
+class WorkerQueue {
   constructor(queue, cellName, deliveryDelay) {
     Object.defineProperties(this, {
       _queue: { value: queue },
@@ -7756,7 +7867,7 @@ class Queue {
 }
 
 __celld.__makeQueue = (queue, cellName, deliveryDelay) =>
-  new Queue(queue, cellName, deliveryDelay);
+  new WorkerQueue(queue, cellName, deliveryDelay);
 
 // ---- D1 -----------------------------------------------------------------
 // A D1 database is a cell of a runtime-supplied Durable Object class, so it
@@ -9579,7 +9690,7 @@ class WorkflowInstance {
   }
 }
 
-class Workflow {
+class WorkflowImpl {
   constructor(workflowName) {
     Object.defineProperty(this, "_workflowName", { value: workflowName });
   }
@@ -9691,7 +9802,7 @@ class Workflow {
 }
 
 const __makeWorkflow = __celld.__makeWorkflow =
-  (workflowName) => new Workflow(workflowName);
+  (workflowName) => new WorkflowImpl(workflowName);
 // `cloudflare:workers` module surface. The DO base class sets ctx/env the
 // way `class X extends DurableObject` expects; env aliases the cell env.
 const __cf = __celld.__cf = {
