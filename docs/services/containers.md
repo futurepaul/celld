@@ -105,7 +105,9 @@ and network namespace, so the engine and not a node-wide fence enforces
 engine routes an intercepted request to a socket of celld's, which dispatches it
 to the binding the object passed, on the service-call path; HTTPS interception
 uses the CA at `/etc/cloudflare/certs/cloudflare-containers-ca.crt`, as on
-Cloudflare. `getTcpPort()` reaches a port through a loopback listener per port,
+Cloudflare. The socket is beside the node's data when that path fits a Unix
+socket's 107 bytes, and otherwise in `$XDG_RUNTIME_DIR/celld`, named by a hash
+of the node's data directory. `getTcpPort()` reaches a port through a loopback listener per port,
 whose connections take a socket from the engine, TCP over the VM's network
 interface or a relay to the guest's loopback.
 

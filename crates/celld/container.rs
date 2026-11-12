@@ -491,6 +491,9 @@ pub(crate) trait Backend: Send + Sync {
     fn restores_snapshots(&self) -> bool;
     /// Whether the engine routes intercepted requests back to the object.
     fn intercepts(&self) -> bool;
+    /// fork: lets go of what the backend holds outside the engine (the krun
+    /// backend's intercept socket), at the node's stop.
+    fn close(&self) {}
 }
 
 pub struct ContainerEngine {
@@ -694,6 +697,7 @@ pub async fn shutdown() {
             "containers of this node may still be running"
         );
     }
+    engine.backend.close();
 }
 
 /// Connect and load every image of the installed specs, ahead of the

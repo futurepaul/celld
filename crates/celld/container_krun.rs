@@ -70,12 +70,48 @@ mod frames {
 const INTERCEPT_BODY_BYTES_MAX: usize = 32 << 20;
 /// A `ports.sock` reply, at most.
 const PORT_REPLY_BYTES_MAX: usize = 4096;
+/// A unix socket's path, at most: Linux's `sun_path` holds 108 bytes, the
+/// last a NUL.
+const SOCKET_PATH_BYTES_MAX: usize = 107;
 
 pub(crate) struct KrunBackend {
     api: Docker,
     ports: PathBuf,
-    /// `unix:<path>` of celld's intercept socket, for the engine.
+    /// celld's intercept socket, and its `unix:<path>` for the engine.
+    intercepts: PathBuf,
     handler: String,
+}
+
+/// fork: where the intercept socket is bound. Beside the node's data when
+/// that path fits a unix socket's; past it (`celld dev` in a project
+/// several directories down, as a test's scratch is, where every bind
+/// failed) in this user's runtime directory (`$XDG_RUNTIME_DIR/celld`,
+/// owner-only), named by a hash of the path it would have had, so two
+/// nodes never share one. Both are in the host's mount namespace, where
+/// the engine (root) dials it.
+fn intercept_socket(data_dir: &Path, node: &str, runtime_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+    use sha2::Digest as _;
+    let beside = data_dir.join(format!("intercepts-{}.sock", &node_prefix(node)[6..12]));
+    if beside.as_os_str().len() <= SOCKET_PATH_BYTES_MAX {
+        return Ok(beside);
+    }
+    let Some(runtime_dir) = runtime_dir.filter(|d| d.is_absolute()) else {
+        return Err(anyhow!(
+            "the intercept socket at {} is past a unix socket's {SOCKET_PATH_BYTES_MAX} bytes, and no \
+             XDG_RUNTIME_DIR names a shorter place: give the node a shorter data directory",
+            beside.display()
+        ));
+    };
+    let digest = sha2::Sha256::digest(beside.as_os_str().as_encoded_bytes());
+    let path = runtime_dir
+        .join("celld")
+        .join(format!("intercepts-{}.sock", &format!("{digest:x}")[..16]));
+    anyhow::ensure!(
+        path.as_os_str().len() <= SOCKET_PATH_BYTES_MAX,
+        "the intercept socket at {} is past a unix socket's {SOCKET_PATH_BYTES_MAX} bytes too",
+        path.display()
+    );
+    Ok(path)
 }
 
 impl KrunBackend {
@@ -98,12 +134,22 @@ impl KrunBackend {
             .parent()
             .map(|dir| dir.join("ports.sock"))
             .ok_or_else(|| anyhow!("the engine's socket has no directory"))?;
-        let intercepts = data_dir.join(format!("intercepts-{}.sock", &node_prefix(node)[6..12]));
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let intercepts = intercept_socket(data_dir, node, runtime_dir.as_deref())?;
+        if let Some(dir) = intercepts.parent().filter(|d| *d != data_dir) {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+        }
         serve_intercepts(&intercepts, runtime)?;
         Ok(KrunBackend {
             api,
             ports,
             handler: format!("unix:{}", intercepts.display()),
+            intercepts,
         })
     }
 
@@ -366,6 +412,10 @@ impl Backend for KrunBackend {
 
     fn intercepts(&self) -> bool {
         true
+    }
+
+    fn close(&self) {
+        let _ = std::fs::remove_file(&self.intercepts);
     }
 }
 
@@ -885,6 +935,30 @@ mod tests {
         assert_eq!(json!(OutputMode::Combined), json!("combined"));
         assert_eq!(json!(OutputMode::Ignore), json!("ignore"));
         assert_eq!(json!(OutputMode::Pipe), json!("pipe"));
+    }
+
+    /// Goal: the intercept socket is beside the node's data when that path
+    /// fits a unix socket's; past it, in the runtime directory, by a hash of
+    /// the data directory (two deep ones never share one), and with no
+    /// runtime directory it is refused, saying why. Replay: the same answer.
+    #[test]
+    fn the_intercept_socket_fits_sun_path() {
+        let run = Path::new("/run/user/1000");
+        let short = Path::new("/var/lib/celld");
+        for _ in 0..2 {
+            let beside = intercept_socket(short, "node-1", Some(run)).unwrap();
+            assert!(beside.starts_with(short), "{}", beside.display());
+            let deep = PathBuf::from(format!("/home/{}/.celld/dev/runtime", "d".repeat(90)));
+            let other = PathBuf::from(format!("/home/{}/.celld/dev/runtime", "e".repeat(90)));
+            let moved = intercept_socket(&deep, "node-1", Some(run)).unwrap();
+            assert!(moved.starts_with("/run/user/1000/celld"), "{}", moved.display());
+            assert!(moved.to_string_lossy().ends_with(".sock"), "{}", moved.display());
+            assert!(moved.as_os_str().len() <= SOCKET_PATH_BYTES_MAX);
+            assert_ne!(moved, intercept_socket(&other, "node-1", Some(run)).unwrap());
+            let e = intercept_socket(&deep, "node-1", None).unwrap_err().to_string();
+            assert!(e.contains("XDG_RUNTIME_DIR") && e.contains("107 bytes"), "{e}");
+            assert!(intercept_socket(&deep, "node-1", Some(Path::new("relative"))).is_err());
+        }
     }
 
     #[test]
