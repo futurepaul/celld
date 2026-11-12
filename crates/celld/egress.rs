@@ -152,17 +152,103 @@ fn never_net(ip: IpAddr, prefix: u8) -> Option<&'static str> {
     NEVER_NETS.iter().find(|(n, len, _)| overlap((ip, prefix), (*n, *len))).map(|(_, _, what)| *what)
 }
 
-/// Whether `ip` may be one of this machine's own addresses: one a socket
-/// can bind to, or one the probe cannot tell about (any error but "not an
-/// address here"), which is refused as if it were. Asked afresh each time,
-/// so an address the machine gains (DHCP, a tailnet) counts at once. A
-/// node set to bind any address (`ip_nonlocal_bind`) calls every address
-/// its own and reaches none.
-pub(crate) fn maybe_own(ip: IpAddr) -> bool {
-    match std::net::UdpSocket::bind((ip, 0)) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::AddrNotAvailable,
+/// The addresses this machine's interfaces hold, from the kernel's own
+/// tables in this network namespace: IPv4's local routes
+/// (`/proc/net/fib_trie`'s `/32 host LOCAL` entries, secondary addresses
+/// among them) and IPv6's addresses (`/proc/net/if_inet6`, absent when
+/// IPv6 is off). Reading them opens no socket, so a sandbox that denies
+/// `bind` (seccomp, systemd's `SocketBindDeny=`) still tells them; glibc's
+/// `getifaddrs` binds a netlink socket, and such a sandbox refuses it.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // the host's network tables, not node storage
+fn interface_addrs() -> std::io::Result<Vec<IpAddr>> {
+    let mut addrs = local_v4(&std::fs::read_to_string("/proc/net/fib_trie")?);
+    match std::fs::read_to_string("/proc/net/if_inet6") {
+        Ok(table) => addrs.extend(table.lines().filter_map(|line| {
+            let hex = line.split_whitespace().next()?;
+            u128::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 32).map(|bits| plain(IpAddr::V6(Ipv6Addr::from(bits))))
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
+    Ok(addrs)
+}
+
+/// The addresses `/proc/net/fib_trie` routes to this host: each
+/// `|-- a.b.c.d` followed by `/32 host LOCAL`.
+#[cfg(target_os = "linux")]
+fn local_v4(trie: &str) -> Vec<IpAddr> {
+    let mut addrs = Vec::new();
+    let mut last: Option<Ipv4Addr> = None;
+    for line in trie.lines().map(str::trim) {
+        if let Some(addr) = line.strip_prefix("|-- ").or_else(|| line.strip_prefix("+-- ")) {
+            last = addr.split('/').next().and_then(|a| a.parse().ok());
+        } else if line == "/32 host LOCAL" {
+            addrs.extend(last.map(IpAddr::V4));
+        }
+    }
+    addrs
+}
+
+/// The addresses this machine's interfaces hold (`getifaddrs`, which reads
+/// them by sysctl on these systems, no `bind`), IPv4 behind IPv6 as IPv4.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn interface_addrs() -> std::io::Result<Vec<IpAddr>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes a list it owns into `head`, freed below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut addrs = Vec::new();
+    let mut at = head;
+    while !at.is_null() {
+        // SAFETY: `at` is a node of the list getifaddrs made, not yet freed;
+        // its address, when set, is a sockaddr of the family it names.
+        unsafe {
+            let ifa = &*at;
+            if !ifa.ifa_addr.is_null() {
+                match i32::from((*ifa.ifa_addr).sa_family) {
+                    libc::AF_INET => {
+                        let sin = &*ifa.ifa_addr.cast::<libc::sockaddr_in>();
+                        addrs.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = &*ifa.ifa_addr.cast::<libc::sockaddr_in6>();
+                        addrs.push(plain(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr))));
+                    }
+                    _ => {}
+                }
+            }
+            at = ifa.ifa_next;
+        }
+    }
+    // SAFETY: `head` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(addrs)
+}
+
+#[cfg(not(unix))]
+fn interface_addrs() -> std::io::Result<Vec<IpAddr>> {
+    Err(std::io::Error::other("no interface discovery on this platform"))
+}
+
+/// Whether `ip` is this machine's own: loopback or unspecified (both reach
+/// it), or an address one of its interfaces holds, compared as IPv4 when
+/// it is IPv4 behind IPv6. The interfaces are read at every ask, so an
+/// address the machine gains or loses (DHCP, a tailnet coming up) counts
+/// at once; on Linux that is two in-memory tables, read for each address
+/// a new connection may use. A read that fails is an `Err`, which refuses
+/// the destination (the node cannot tell, so it fails closed).
+/// An address family the node cannot open a socket in (IPv6 disabled)
+/// is simply on no interface: a public address there is not its own, and
+/// its dial fails as unreachable.
+pub(crate) fn own_address(ip: IpAddr) -> Result<bool, String> {
+    let ip = plain(ip);
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Ok(true);
+    }
+    let addrs = interface_addrs().map_err(|e| format!("reading this node's interfaces failed: {e}"))?;
+    Ok(addrs.contains(&ip))
 }
 
 impl Allow {
@@ -342,19 +428,31 @@ fn bare(host: &str) -> &str {
 
 /// The refusal for a host that is an IP literal `public` keeps out and
 /// `allow` does not open, or one `own` claims.
-fn host_refused(host: &str, public: fn(IpAddr) -> bool, allow: Option<&Allow>, own: fn(IpAddr) -> bool) -> Option<EgressRefused> {
+fn host_refused(host: &str, public: fn(IpAddr) -> bool, allow: Option<&Allow>, own: Own) -> Option<EgressRefused> {
     let ip: IpAddr = bare(host).parse().ok()?;
     if !public(ip) && !allow.is_some_and(|a| a.admits(host, ip)) {
         return Some(EgressRefused(format!("egress refused: {ip} is not a public address")));
     }
-    own(ip).then(|| EgressRefused(format!("egress refused: {ip} is this node's own address")))
+    own_refused(ip, own)
+}
+
+/// How a rule tells this machine's own addresses (`own_address`).
+type Own = fn(IpAddr) -> Result<bool, String>;
+
+/// The refusal for an address `own` claims, or cannot tell about.
+fn own_refused(ip: IpAddr, own: Own) -> Option<EgressRefused> {
+    match own(ip) {
+        Ok(false) => None,
+        Ok(true) => Some(EgressRefused(format!("egress refused: {ip} is this node's own address"))),
+        Err(why) => Some(EgressRefused(format!("egress refused: cannot tell whether {ip} is this node's own address ({why})"))),
+    }
 }
 
 /// The refusal for a URL whose host is an IP literal this node keeps out:
 /// its own, or a non-public one its allowlist does not open.
 pub fn literal_refused(url: &str) -> Option<EgressRefused> {
     let parsed = reqwest::Url::parse(url).ok()?;
-    host_refused(parsed.host_str()?, is_public, allowed(), maybe_own)
+    host_refused(parsed.host_str()?, is_public, allowed(), own_address)
 }
 
 /// The refusal for a redirect, when this node limits egress.
@@ -394,7 +492,7 @@ async fn public_addrs(
     port: u16,
     public: fn(IpAddr) -> bool,
     allow: Option<&Allow>,
-    own: fn(IpAddr) -> bool,
+    own: Own,
 ) -> Result<Vec<SocketAddr>, DialError> {
     if let Some(refused) = host_refused(host, public, allow, own) {
         return Err(DialError::Refused(refused));
@@ -405,8 +503,14 @@ async fn public_addrs(
     // A name the system resolver reads as a number (`127.1`, `2130706433`)
     // is a name here: it resolves, and the filter judges what it became.
     let all = tokio::net::lookup_host((bare(host), port)).await.map_err(DialError::Io)?;
-    let kept: Vec<SocketAddr> =
-        all.filter(|a| (public(a.ip()) || allow.is_some_and(|al| al.admits(host, a.ip()))) && !own(a.ip())).collect();
+    let mut kept = Vec::new();
+    for a in all.filter(|a| public(a.ip()) || allow.is_some_and(|al| al.admits(host, a.ip()))) {
+        match own(a.ip()) {
+            Ok(false) => kept.push(a),
+            Ok(true) => {}
+            Err(_) => return Err(DialError::Refused(own_refused(a.ip(), own).expect("an Err refuses"))),
+        }
+    }
     if kept.is_empty() {
         return Err(DialError::Refused(EgressRefused(format!(
             "egress refused: {host} resolves to no public address"
@@ -424,9 +528,9 @@ pub struct Policy {
     public: Option<fn(IpAddr) -> bool>,
     /// What the operator opens beside it (`CELLD_EGRESS_ALLOW`).
     allow: Option<&'static Allow>,
-    /// Whether an address may be this machine's own, refused whenever
-    /// `public` limits anything (`maybe_own`).
-    own: fn(IpAddr) -> bool,
+    /// Whether an address is this machine's own, refused whenever `public`
+    /// limits anything (`own_address`).
+    own: Own,
 }
 
 impl std::fmt::Debug for Policy {
@@ -438,10 +542,10 @@ impl std::fmt::Debug for Policy {
 impl Policy {
     /// No limit: a node without the setting, celld's own connections, and an
     /// object's own container port, which the node handed it (`getTcpPort`).
-    pub const OPEN: Policy = Policy { public: None, allow: None, own: maybe_own };
+    pub const OPEN: Policy = Policy { public: None, allow: None, own: own_address };
 
     /// Public addresses only.
-    pub const PUBLIC: Policy = Policy { public: Some(is_public), allow: None, own: maybe_own };
+    pub const PUBLIC: Policy = Policy { public: Some(is_public), allow: None, own: own_address };
 
     /// This node's rule for a Worker's socket.
     pub fn node() -> Policy {
@@ -469,7 +573,7 @@ struct PublicOnlyResolver;
 impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         Box::pin(async move {
-            match public_addrs(name.as_str(), 0, is_public, allowed(), maybe_own).await {
+            match public_addrs(name.as_str(), 0, is_public, allowed(), own_address).await {
                 Ok(public) => Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs),
                 Err(DialError::Refused(refused)) => Err(Box::new(refused) as Box<dyn std::error::Error + Send + Sync>),
                 Err(DialError::Io(error)) => Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
@@ -508,7 +612,7 @@ pub(crate) mod tests {
     /// A rule under which loopback stands in for the public internet (and
     /// so is no address of this machine's), so a test can watch an allowed
     /// dial land without leaving the machine.
-    pub(crate) const LOOPBACK_IS_PUBLIC: Policy = Policy { public: Some(|ip| ip.is_loopback()), allow: None, own: |_| false };
+    pub(crate) const LOOPBACK_IS_PUBLIC: Policy = Policy { public: Some(|ip| ip.is_loopback()), allow: None, own: |_| Ok(false) };
 
     /// Hosts a public-only rule refuses, as `connect()` and a URL name them:
     /// loopback, private, link-local (the metadata service), shared,
@@ -565,9 +669,9 @@ pub(crate) mod tests {
     // Valid: a public literal is kept as it is, with no lookup.
     #[tokio::test]
     async fn a_public_literal_is_kept() {
-        let addrs = public_addrs("1.1.1.1", 443, is_public, None, maybe_own).await.unwrap();
+        let addrs = public_addrs("1.1.1.1", 443, is_public, None, own_address).await.unwrap();
         assert_eq!(addrs, ["1.1.1.1:443".parse::<SocketAddr>().unwrap()]);
-        let addrs = public_addrs("[2606:4700::1111]", 443, is_public, None, maybe_own).await.unwrap();
+        let addrs = public_addrs("[2606:4700::1111]", 443, is_public, None, own_address).await.unwrap();
         assert_eq!(addrs, ["[2606:4700::1111]:443".parse::<SocketAddr>().unwrap()]);
     }
 
@@ -706,9 +810,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_listed_literal_is_kept() {
         let a = Allow::parse("10.255.0.0/16").unwrap();
-        let addrs = public_addrs("10.255.0.1", 80, is_public, Some(&a), maybe_own).await.unwrap();
+        let addrs = public_addrs("10.255.0.1", 80, is_public, Some(&a), own_address).await.unwrap();
         assert_eq!(addrs, ["10.255.0.1:80".parse::<SocketAddr>().unwrap()]);
-        let message = match public_addrs("10.254.0.1", 80, is_public, Some(&a), maybe_own).await {
+        let message = match public_addrs("10.254.0.1", 80, is_public, Some(&a), own_address).await {
             Err(DialError::Refused(refused)) => refused.0,
             other => panic!("expected a refusal, got {other:?}"),
         };
@@ -734,14 +838,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_never_name_with_a_public_answer_is_refused() {
         let allow = Allow::parse("wiki.internal,!one.one.one.one").unwrap();
-        match public_addrs("one.one.one.one", 80, is_public, Some(&allow), maybe_own).await {
+        match public_addrs("one.one.one.one", 80, is_public, Some(&allow), own_address).await {
             Err(DialError::Refused(refused)) => assert!(refused.0.starts_with("egress refused: "), "{}", refused.0),
             Err(DialError::Io(error)) => eprintln!("skipped: one.one.one.one does not resolve here ({error})"),
             Ok(addrs) => panic!("a `!` name reached {addrs:?}"),
         }
         // the same, offline: loopback stands in for the public internet
         let allow = Allow::parse("wiki.internal,!localhost").unwrap();
-        let kept = public_addrs("localhost", 80, |ip| ip.is_loopback(), Some(&allow), |_| false).await;
+        let kept = public_addrs("localhost", 80, |ip| ip.is_loopback(), Some(&allow), |_| Ok(false)).await;
         assert!(matches!(kept, Err(DialError::Refused(_))), "{kept:?}");
     }
 
@@ -753,7 +857,7 @@ pub(crate) mod tests {
         let port = listener.local_addr().unwrap().port();
         let allow: &'static Allow = Box::leak(Box::new(Allow::parse("wiki.internal").unwrap()));
         // the stand-in, with this machine's real probe in place of its "none"
-        let rule = Policy { allow: Some(allow), own: maybe_own, ..LOOPBACK_IS_PUBLIC };
+        let rule = Policy { allow: Some(allow), own: own_address, ..LOOPBACK_IS_PUBLIC };
         let message = refusal(rule.connect("127.0.0.1", port).await);
         assert!(message.starts_with("egress refused: "), "{message}");
         let open = Policy::OPEN.connect("127.0.0.1", port).await.unwrap();
@@ -766,31 +870,170 @@ pub(crate) mod tests {
     async fn with_no_list_an_own_address_is_refused() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let everything_public = Policy { public: Some(|_| true), allow: None, own: maybe_own };
+        let everything_public = Policy { public: Some(|_| true), allow: None, own: own_address };
         for host in ["127.0.0.1", "localhost"] {
             let message = refusal(everything_public.connect(host, port).await);
             assert!(message.starts_with("egress refused: "), "{host}: {message}");
         }
         assert_eq!(
-            host_refused("127.0.0.1", |_| true, None, maybe_own).map(|r| r.0).as_deref(),
+            host_refused("127.0.0.1", |_| true, None, own_address).map(|r| r.0).as_deref(),
             Some("egress refused: 127.0.0.1 is this node's own address")
         );
         let open = Policy::OPEN.connect("127.0.0.1", port).await.unwrap();
         first_accepted_is(&listener, &open).await;
     }
 
-    // The probe: this machine's addresses are its own, an address no
-    // interface has is not, and one it cannot tell about is refused.
+    // This machine's addresses, by its interfaces: loopback and
+    // unspecified in each spelling, an interface's address and its mapped
+    // form are its own; a public address or one no interface has is not.
     #[test]
-    fn the_own_address_probe() {
-        assert!(maybe_own(ip("127.0.0.1")));
-        assert!(!maybe_own(ip("10.255.255.254")) || own_v4() == Some(ip("10.255.255.254")));
-        assert!(!maybe_own(ip("1.1.1.1")));
-        if let Some(own) = own_v4() {
-            assert!(maybe_own(own), "{own}");
+    #[allow(clippy::disallowed_methods)] // the test host's own tables
+    fn own_addresses_by_interface() {
+        for own in ["127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1", "0.0.0.0", "::"] {
+            assert_eq!(own_address(ip(own)), Ok(true), "{own}");
         }
-        // a link-local IPv6 address names no interface: the probe cannot
-        // tell (EINVAL, not EADDRNOTAVAIL), so it is refused
-        assert!(maybe_own(ip("fe80::1")));
+        for other in ["1.1.1.1", "::ffff:1.1.1.1", "2606:4700::1111", "64:ff9b::101:101"] {
+            assert_eq!(own_address(ip(other)), Ok(false), "{other}");
+        }
+        let addrs = interface_addrs().unwrap();
+        assert!(addrs.contains(&ip("127.0.0.1")), "{addrs:?}");
+        if let Some(own) = own_v4() {
+            assert!(addrs.contains(&own), "{own} in {addrs:?}");
+            assert_eq!(own_address(own), Ok(true));
+            let IpAddr::V4(v4) = own else { unreachable!("own_v4") };
+            assert_eq!(own_address(IpAddr::V6(v4.to_ipv6_mapped())), Ok(true));
+        }
+        if !addrs.contains(&ip("10.255.255.254")) {
+            assert_eq!(own_address(ip("10.255.255.254")), Ok(false));
+        }
+        assert!(addrs.contains(&ip("::1")) || !std::path::Path::new("/proc/net/if_inet6").exists(), "{addrs:?}");
+        // a read that fails is refused, saying why
+        let refused = own_refused(ip("1.1.1.1"), |_| Err("reading this node's interfaces failed: test".into()));
+        assert_eq!(
+            refused.map(|r| r.0).as_deref(),
+            Some("egress refused: cannot tell whether 1.1.1.1 is this node's own address (reading this node's interfaces failed: test)")
+        );
+    }
+
+    /// The child half of `a_bind_denied_sandbox_keeps_public_egress`: it
+    /// runs only in the process that test starts, under a seccomp filter
+    /// that answers every `bind` with `CELLD_TEST_BIND_DENIED`'s errno,
+    /// while TCP connect still binds its own port implicitly.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a child process of the test's own, on the host's clock
+    fn bind_denied_child() {
+        let Ok(errno) = std::env::var("CELLD_TEST_BIND_DENIED") else { return };
+        let errno: u32 = errno.parse().unwrap();
+        let no_inet6 = std::env::var("CELLD_TEST_NO_INET6").is_ok();
+        deny_bind(errno, no_inet6);
+        let own: IpAddr = std::env::var("CELLD_TEST_OWN").unwrap().parse().unwrap();
+        let port: u16 = std::env::var("CELLD_TEST_PORT").unwrap().parse().unwrap();
+        let error = std::net::UdpSocket::bind("0.0.0.0:0").expect_err("the filter denies bind");
+        assert_eq!(error.raw_os_error(), Some(errno as i32), "{error}");
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            // TCP still leaves: connect binds implicitly
+            let open = Policy::OPEN.connect(&own.to_string(), port).await;
+            assert!(open.is_ok(), "a plain TCP connect under the filter: {:?}", open.err());
+            // public literals are no address of this node's
+            for host in ["1.1.1.1", "[2606:4700::1111]"] {
+                assert!(host_refused(host, is_public, None, own_address).is_none(), "{host}");
+                let kept = public_addrs(host, 443, is_public, None, own_address).await;
+                assert!(kept.is_ok(), "{host}: {:?}", kept.err().map(|e| e.to_string()));
+            }
+            // with IPv6 sockets refused (IPv6 off), a public IPv6 address is
+            // still no address of this node's: its dial fails as unreachable
+            if no_inet6 {
+                let off = std::net::TcpListener::bind("[::1]:0").expect_err("the filter refuses IPv6 sockets");
+                assert_eq!(off.raw_os_error(), Some(libc::EAFNOSUPPORT), "{off}");
+                match Policy::PUBLIC.connect("2606:4700::1111", 443).await {
+                    Err(DialError::Io(_)) => {}
+                    Err(DialError::Refused(refused)) => panic!("refused, not unreachable: {}", refused.0),
+                    Ok(_) => panic!("an IPv6 socket under a filter that refuses them"),
+                }
+            }
+            // the node's own address stays shut, however public the rule calls it
+            let everything_public = Policy { public: Some(|_| true), allow: None, own: own_address };
+            let message = refusal(everything_public.connect(&own.to_string(), port).await);
+            assert_eq!(message, format!("egress refused: {own} is this node's own address"));
+            // the review's reproduction, where the internet is reachable
+            let direct = tokio::time::timeout(std::time::Duration::from_secs(3), tokio::net::TcpStream::connect("1.1.1.1:443")).await;
+            if matches!(direct, Ok(Ok(_))) {
+                let public = Policy::PUBLIC.connect("1.1.1.1", 443).await;
+                assert!(public.is_ok(), "Policy::PUBLIC after a direct connect worked: {:?}", public.err().map(|e| e.to_string()));
+            } else {
+                eprintln!("1.1.1.1:443 is unreachable here: the review's direct reproduction is skipped");
+            }
+        });
+    }
+
+    /// Installs a seccomp filter on every thread of this process: `bind`
+    /// fails with `errno`, and with `no_inet6` an IPv6 socket fails with
+    /// EAFNOSUPPORT (IPv6 off); every other call is allowed.
+    #[cfg(target_os = "linux")]
+    fn deny_bind(errno: u32, no_inet6: bool) {
+        let ld = |k| libc::sock_filter { code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, jt: 0, jf: 0, k };
+        let jeq = |k, jf| libc::sock_filter { code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16, jt: 0, jf, k };
+        let ret = |k| libc::sock_filter { code: (libc::BPF_RET | libc::BPF_K) as u16, jt: 0, jf: 0, k };
+        // a family no socket call names stands in when IPv6 stays on
+        let family = if no_inet6 { libc::AF_INET6 as u32 } else { u32::MAX };
+        let filter = [
+            ld(0), // the syscall number, at seccomp_data's offset 0
+            jeq(libc::SYS_bind as u32, 1),
+            ret(libc::SECCOMP_RET_ERRNO | errno),
+            jeq(libc::SYS_socket as u32, 3),
+            ld(16), // socket's first argument (its family), low half
+            jeq(family, 1),
+            ret(libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32),
+            ret(libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr().cast_mut() };
+        // SAFETY: plain syscalls on a filter that outlives them (the kernel copies it)
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs");
+            let set = libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, libc::SECCOMP_FILTER_FLAG_TSYNC, &program as *const libc::sock_fprog);
+            assert_eq!(set, 0, "seccomp: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    // Review round 2's reproduction: a sandbox that denies explicit `bind`
+    // (seccomp EACCES or EPERM, systemd's SocketBindDeny=) still lets TCP
+    // out, and public egress must still pass there; the node's own
+    // address must still be refused. Run in a child process, so the filter
+    // reaches no other test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bind_denied_sandbox_keeps_public_egress() {
+        if std::env::var("CELLD_TEST_BIND_DENIED").is_ok() {
+            return;
+        }
+        let Some(own) = own_v4() else { return };
+        let listener = std::net::TcpListener::bind((own, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for (errno, no_inet6) in [(libc::EACCES, false), (libc::EPERM, false), (libc::EACCES, true)] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            if no_inet6 {
+                child.env("CELLD_TEST_NO_INET6", "1");
+            }
+            let out = child
+                .args(["--exact", "egress::tests::bind_denied_child", "--test-threads=1", "--nocapture"])
+                .env("CELLD_TEST_BIND_DENIED", errno.to_string())
+                .env("CELLD_TEST_OWN", own.to_string())
+                .env("CELLD_TEST_PORT", port.to_string())
+                .output()
+                .unwrap();
+            let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success() && said.contains("1 passed"), "errno {errno}, IPv6 off {no_inet6}:\n{said}");
+        }
+    }
+
+    // The kernel's IPv4 table, as it prints it: the local routes' addresses
+    // are this host's (a secondary one too), a network's or a broadcast's
+    // are not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_routes_name_the_hosts_addresses() {
+        let trie = "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 0.0.0.0\n        /0 universe UNICAST\n     +-- 192.168.8.0/24 2 0 2\n        |-- 192.168.8.0\n           /24 link UNICAST\n        |-- 192.168.8.197\n           /32 host LOCAL\n        |-- 192.168.8.200\n           /32 host LOCAL\n        |-- 192.168.8.255\n           /32 link BROADCAST\nLocal:\n  +-- 127.0.0.0/8 2 0 2\n     +-- 127.0.0.0/31 1 0 0\n        |-- 127.0.0.0\n           /8 host LOCAL\n        |-- 127.0.0.1\n           /32 host LOCAL\n     |-- 100.101.102.103\n        /32 host LOCAL\n";
+        assert_eq!(local_v4(trie), [ip("192.168.8.197"), ip("192.168.8.200"), ip("127.0.0.1"), ip("100.101.102.103")]);
     }
 }
