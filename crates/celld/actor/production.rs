@@ -30,7 +30,15 @@ impl Actor {
                     self.step(ActorInput::Completed(completed), &mut out);
                 }
                 Some(expired) = delays.next(), if !delays.is_empty() => {
-                    let arm = expired.into_inner();
+                    let Some(arm) = requeue_early(
+                        expired.into_inner(),
+                        crate::asyncrt::mono_ms(),
+                        &mut delays,
+                        &mut timer_slots,
+                    )
+                    else {
+                        continue;
+                    };
                     if timer_slots.fire(&arm.slot, arm.ordinal).is_some() {
                         self.step(ActorInput::TimerFired(arm.timer), &mut out);
                     }

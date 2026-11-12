@@ -203,6 +203,15 @@ class CelldBodyStream extends ReadableStream {
     }
     return super.getReader(options);
   }
+  // Each branch carries all that is left, as on workerd: its length
+  // too, while nothing has been read.
+  tee() {
+    const length = __declaredStreamLength(this);
+    const branches = super.tee();
+    if (length !== undefined)
+      for (const branch of branches) branch._expectedLength = length;
+    return branches;
+  }
   // Cancelling a body stream poisons later consumption: text()
   // and friends reject, as they would over a real socket.
   _cancel(reason) {
@@ -210,8 +219,46 @@ class CelldBodyStream extends ReadableStream {
     return super._cancel(reason);
   }
 }
+// The length a request's header list declares for its body, as workerd
+// reads it: Content-Length, unless the body is chunked. Only a streamed body
+// asks, so a request that is never forwarded never parses its headers here.
+const __declaredBodyLength = (headersJson) => {
+  let length;
+  for (const [name, value] of JSON.parse(headersJson)) {
+    const lower = name.toLowerCase();
+    if (lower === "transfer-encoding") return undefined;
+    if (lower === "content-length" && /^[0-9]+$/.test(value.trim()))
+      length = Number(value.trim());
+  }
+  return Number.isSafeInteger(length) ? length : undefined;
+};
+// The length a body stream still declares: none once a byte has left it (a
+// read, a pipe, a tee), so a forwarded remainder never claims the whole
+// body's length. workerd refuses a stream read from as a body ("This
+// ReadableStream is disturbed"); celld forwards the rest, of no length.
+const __declaredStreamLength = (stream) =>
+  stream._disturbed === true ? undefined : stream._expectedLength;
+// A subrequest body's framing, as the HTTP layer gives it on workerd: a
+// known length is its Content-Length, an unknown one is chunked. Headers
+// that name either are kept, and so is a header list still the wire's own
+// (a request forwarded whole), which already carries its framing. A held
+// body that is empty declares nothing: celld's Request does not tell an
+// absent body from an empty one, and workerd frames only the second.
+const __frameSubrequestBody = (req) => {
+  if (req.body === null || req._headersJson !== undefined) return;
+  const length = req._bodyBytes !== null
+    ? req._bodyBytes.byteLength || undefined
+    : __declaredStreamLength(req.body);
+  if (req._bodyBytes !== null && length === undefined) return;
+  const headers = req.headers;
+  if (headers.has("content-length") || headers.has("transfer-encoding")) return;
+  if (length === undefined) headers.set("transfer-encoding", "chunked");
+  else headers.set("content-length", String(length));
+};
 class CelldHttpBodyStream extends ReadableStream {
-  constructor(streamId) {
+  // `length` is the one the request declared, which forwarding it carries
+  // on as workerd's body stream does (see __frameSubrequestBody).
+  constructor(streamId, length) {
     const id = Number(streamId);
     super({
       async pull(controller) {
@@ -224,17 +271,20 @@ class CelldHttpBodyStream extends ReadableStream {
       cancel() { __http_stream_cancel(id); },
     }, { highWaterMark: 0 });
     this.__celldStreamId = id;
+    if (length !== undefined) this._expectedLength = length;
   }
   tee() {
     if (this.locked) throw new TypeError("ReadableStream is locked");
+    // Each branch carries all that is left, as on workerd.
+    const length = __declaredStreamLength(this);
     this._locked = true;
     this._disturbed = true;
     const [left, right] = JSON.parse(
       __http_stream_tee(this.__celldStreamId),
     );
     return [
-      new CelldHttpBodyStream(left),
-      new CelldHttpBodyStream(right),
+      new CelldHttpBodyStream(left, length),
+      new CelldHttpBodyStream(right, length),
     ];
   }
 }
@@ -3646,7 +3696,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
     if (req._bodyBytes === null &&
         !req.headers.has("content-length") &&
         !req.headers.has("transfer-encoding")) {
-      const length = req.body._expectedLength;
+      const length = __declaredStreamLength(req.body);
       if (length === undefined)
         req.headers.set("transfer-encoding", "chunked");
       else req.headers.set("content-length", String(length));
@@ -5308,6 +5358,7 @@ class DurableObjectNamespace {
         // rather than the whole body (#156). The host keeps it a stream for a
         // local cell and collects it only to sign a cross-node frame. A held
         // body -- or a stream with no host id -- crosses as its bytes.
+        __frameSubrequestBody(req);
         const bodyStreamId =
           req._bodyBytes === null && req.body && req.body.__celldStreamId !== undefined
             ? req.body.__celldStreamId
@@ -5450,14 +5501,17 @@ __celld.__makeIncomingRequest = (
   url, method, body, headersJson, streamId,
 ) => __makeRequest(
   url, method,
-  streamId === undefined ? body : new CelldHttpBodyStream(streamId),
+  streamId === undefined
+    ? body
+    : new CelldHttpBodyStream(streamId, __declaredBodyLength(headersJson)),
   headersJson, undefined, true);
 const __dispatchTo = __celld.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
 ) => {
   // A routed body that must not be collected crosses as a host stream id; the
   // handler here reads it in parts. A held body arrives as its bytes.
-  if (bodyStreamId !== null) body = new CelldHttpBodyStream(bodyStreamId);
+  if (bodyStreamId !== null)
+    body = new CelldHttpBodyStream(bodyStreamId, __declaredBodyLength(headersJson));
   // Request already allocates a default controller for an absent signal.
   // Retain that same allocation so a streamed response can report reader
   // cancellation after the handler has returned.

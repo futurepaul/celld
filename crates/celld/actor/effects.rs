@@ -246,12 +246,95 @@ pub(crate) fn drain_step_output(
         }
     }
     for arm in out.timers.drain(..) {
-        let delay = std::time::Duration::from_millis(
-            arm.at_mono_ms.saturating_sub(crate::asyncrt::mono_ms()),
-        );
-        let key = delays.insert(arm.clone(), delay);
+        let key = queue_arm(delays, arm.clone(), crate::asyncrt::mono_ms());
         if let Some(displaced) = timers.install(&arm, key) {
             delays.remove(&displaced);
         }
+    }
+}
+
+/// The longest wait one arm puts in the timer queue.
+///
+/// tokio-util's `DelayQueue` panics on a deadline past its wheel's span,
+/// 2^36 - 1 ms (about 2.2 years), counted from the queue's own clock, which
+/// lags until the queue is next polled. A timer due later than this (an
+/// object's alarm in 2100) is queued at this bound and queued again for the
+/// rest when that expires ([`requeue_early`]). A year leaves the other half
+/// of the span for the lag.
+pub(crate) const MAX_QUEUED_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+const _: () = assert!(MAX_QUEUED_MS < (1 << 36) - 1);
+
+fn queue_arm(delays: &mut DelayQueue<TimerArm>, arm: TimerArm, now_mono_ms: u64) -> delay_queue::Key {
+    let wait = arm.at_mono_ms.saturating_sub(now_mono_ms).min(MAX_QUEUED_MS);
+    delays.insert(arm, std::time::Duration::from_millis(wait))
+}
+
+/// Queues the rest of an arm that expired before its time, because it was
+/// queued at [`MAX_QUEUED_MS`]. Answers the arm back when it is due, to fire.
+pub(crate) fn requeue_early(
+    arm: TimerArm,
+    now_mono_ms: u64,
+    delays: &mut DelayQueue<TimerArm>,
+    timers: &mut TimerSlots<delay_queue::Key>,
+) -> Option<TimerArm> {
+    if arm.at_mono_ms <= now_mono_ms || !timers.is_armed(&arm.slot, arm.ordinal) {
+        return Some(arm);
+    }
+    let key = queue_arm(delays, arm.clone(), now_mono_ms);
+    // The key it displaces is the one that just expired: the queue holds it
+    // no longer, so there is nothing to remove.
+    timers.install(&arm, key);
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use celld_logic::Timer;
+
+    const LATER_MS: u64 = 5_000;
+    // The queue rounds a deadline up to its next millisecond.
+
+    /// An alarm past the queue's span is queued at its bound, queued again
+    /// for the rest when that expires, and answered to fire only when due.
+    #[tokio::test]
+    async fn a_timer_past_the_queues_span_waits_out_its_whole_time() {
+        let mut delays = DelayQueue::new();
+        let mut timers = TimerSlots::<delay_queue::Key>::default();
+        // The Actor numbers each arm; the loop holds its queue key.
+        let mut actor = TimerSlots::<()>::default();
+        let now = 1_000;
+        let at = now + MAX_QUEUED_MS + LATER_MS;
+        let timer = Timer::CellAlarm {
+            cell: "far".to_string(),
+            generation: 1,
+        };
+        let (arm, _) = actor.arm(timer, at, ());
+        let key = queue_arm(&mut delays, arm.clone(), now);
+        assert!(timers.install(&arm, key).is_none());
+        let queued = delays.deadline(&key) - tokio::time::Instant::now();
+        assert!(queued <= std::time::Duration::from_millis(MAX_QUEUED_MS + 1), "{queued:?}");
+        delays.remove(&key);
+
+        // The bound expired, short of the alarm's time: queued again, not fired.
+        let bound = now + MAX_QUEUED_MS;
+        assert_eq!(requeue_early(arm.clone(), bound, &mut delays, &mut timers), None);
+        assert_eq!(delays.len(), 1);
+        assert!(timers.is_armed(&arm.slot, arm.ordinal));
+        let key = delays.peek().expect("queued again");
+        let queued = delays.deadline(&key) - tokio::time::Instant::now();
+        assert!(queued <= std::time::Duration::from_millis(LATER_MS + 1), "{queued:?}");
+        delays.remove(&key);
+
+        // Due: answered back to fire.
+        assert_eq!(requeue_early(arm.clone(), at, &mut delays, &mut timers), Some(arm.clone()));
+        assert!(delays.is_empty());
+
+        // An arm another displaced is never queued again.
+        let (newer, _) = actor.arm(arm.timer.clone(), at, ());
+        assert_ne!(newer.ordinal, arm.ordinal);
+        timers.install(&newer, delays.insert(newer.clone(), std::time::Duration::ZERO));
+        assert_eq!(requeue_early(arm.clone(), bound, &mut delays, &mut timers), Some(arm));
+        assert_eq!(delays.len(), 1, "only the newer arm is queued");
     }
 }

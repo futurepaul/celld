@@ -44,6 +44,27 @@ checked against v0.6.3 (2026-10-22).
   ("SELF-FENCE: node lease not renewed within
   TTL", exit 3), taking the whole dev stack down. No setting lengthens the
   lease. Seen on v0.6.3, 2026-10-22.
+- **An alarm more than about two years ahead panics the node.** In any
+  object, `await ctx.storage.setAlarm(Date.UTC(2100, 0, 1))` stops
+  `celld dev` at once: `thread 'celld-core' panicked at
+  crates/celld/actor/effects.rs:252:26: invalid deadline; err=Invalid`
+  (tokio-util's `DelayQueue` takes at most 2^36 - 1 ms). Once such an
+  alarm is stored, every later start panics the same way. workerd takes
+  it. Seen on v0.6.3, 2026-11-11; fixed on this fork (PR #9).
+- **A body forwarded to an object loses its length.** In a Worker,
+  `env.BOX.getByName("x").fetch("https://x/", { method: "PUT", body:
+  request.body })` gives the object neither Content-Length nor
+  Transfer-Encoding, whatever the incoming request declared; so does a
+  string body or a `FixedLengthStream`. workerd sends a known length as
+  Content-Length and an unknown one as chunked. `fetch(request)`, the
+  request forwarded whole, keeps its headers. Seen on v0.6.3,
+  2026-11-11; fixed on this fork (PR #9).
+- **A teed upload can hang.** A Worker that tees an incoming body past
+  1 MiB (a host stream), forwards one branch to an object and then reads
+  the other sometimes never answers: `curl --data-binary @3mb.bin` timed
+  out in 2 of 4 tries, with or without `Expect: 100-continue`. Seen on
+  v0.6.3, 2026-11-12, while checking a tee's length for PR #9; not
+  fixed.
 - **A private CA reaches only `fetch`.** Stock celld trusts
   `SSL_CERT_FILE` for a Worker's `fetch`, but not for outbound WebSockets
   or `connect()`. This fork's `CELLD_EXTRA_CA_FILE` covers all three.
