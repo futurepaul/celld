@@ -40,7 +40,10 @@ checked against v0.6.3 (2026-10-22).
   ~3.3 s, and one renewal that stalled past its 2.5 s timeout (the box
   was busy) fenced the node ("SELF-FENCE: node lease not renewed within
   TTL", exit 3), taking the whole dev stack down. No setting lengthens the
-  lease. Seen on v0.6.3, 2026-10-22.
+  lease. Seen on v0.6.3, 2026-10-22. The stall is the store's disk, not a
+  starved thread: writeback on the same disk holds every SQLite call
+  past the TTL (up to 10.8 s), and state on tmpfs never stalls. Measured,
+  with a repro, in `upstream-issues/dev-self-fence.md` (2026-11-11).
 - **A private CA reaches only `fetch`.** Stock celld trusts
   `SSL_CERT_FILE` for a Worker's `fetch`, but not for outbound WebSockets
   or `connect()`. This fork's `CELLD_EXTRA_CA_FILE` covers all three.
