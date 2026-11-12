@@ -382,6 +382,9 @@ pub struct CellContainer {
     /// Written with `send_replace`: a plain `send` discards the value
     /// while nobody subscribes, and `monitor()` usually subscribes late.
     exit: watch::Sender<Option<(u64, Result<RunExit, String>)>>,
+    /// fork: the run whose start ended last (started, failed, or destroyed
+    /// as it started), for an `exec()` that waits out a start under way.
+    up: watch::Sender<u64>,
     /// fork: held while the intercepts are sent to the engine, each send the
     /// whole list as it is once held, so a send that read fewer never
     /// lands after one that read more (the engine replaces them whole).
@@ -456,8 +459,6 @@ impl CellContainer {
             Some((ended, result)) if ended >= run => Some(result),
             _ => None,
         }
-        }
-        (self.current_run() > run).then(|| Err("a later start replaced this run".to_string()))
     }
 
     /// `inspect()`: the running container's image and labels, or `None`.
@@ -827,6 +828,7 @@ impl ContainerEngine {
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
+                    up: watch::channel(0).0,
                     intercepts_sent: tokio::sync::Mutex::new(()),
                 })
             });
@@ -970,6 +972,7 @@ impl ContainerEngine {
                 drop(state);
                 cell.exit
                     .send_replace(Some((run, Err(format!("{error:#}")))));
+                cell.up.send_replace(run);
                 return Err(error);
             }
         };
@@ -986,6 +989,7 @@ impl ContainerEngine {
             }
             (destroyed, state.intercepts.len() > launched)
         };
+        cell.up.send_replace(run);
         // fork: an intercept the object added while the start was under way
         // (its `start()` returns at once, and an object sets its intercepts
         // right after, as on Cloudflare) was recorded, not sent: the engine
@@ -1279,8 +1283,24 @@ impl ContainerEngine {
         cell: &Arc<CellContainer>,
         params: ExecParams,
     ) -> anyhow::Result<Arc<ExecProcess>> {
-        if !cell.running() {
-            return Err(anyhow!("exec() requires a running container."));
+        // fork: an exec while the start is under way waits for it, as on
+        // Cloudflare, where exec() on a container still starting runs once it
+        // is up; the krun engine refuses one (409, still starting). Bounded by
+        // the start, which ends either way (`up`).
+        let mut up = cell.up.subscribe();
+        loop {
+            {
+                let state = cell.state.lock().unwrap();
+                if !state.running {
+                    return Err(anyhow!("exec() requires a running container."));
+                }
+                if state.info.started {
+                    break;
+                }
+            }
+            if up.changed().await.is_err() {
+                return Err(anyhow!("the container engine went away"));
+            }
         }
         let pty = params.pty.is_some();
         let started = self.backend.exec(&cell.name, &params).await?;

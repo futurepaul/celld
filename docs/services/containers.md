@@ -110,6 +110,8 @@ socket's 107 bytes, and otherwise in `$XDG_RUNTIME_DIR/celld`, named by a hash
 of the node's data directory. An intercept the object sets while a `start()` is
 under way reaches the engine once the container runs, and a host intercepted
 again takes the new binding in its place, counting once toward the 128 entries.
+An `exec()` while a `start()` is under way waits for the container to be up, as
+on Cloudflare, where the engine would refuse it.
 A WebSocket upgrade to an intercepted host reaches the binding, which answers it
 as it answers a client's. A body of 1 MiB or more, or of no declared length,
 streams to the binding, at most `CELLD_MAX_REQUEST_BODY_BYTES`. `getTcpPort()` reaches a port through a loopback listener per port,

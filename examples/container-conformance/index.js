@@ -135,6 +135,14 @@ export class Conformance extends DurableObject {
       return expect(r.body === "intercepted GET http://early.example/early", r);
     });
     await stop();
+    // An exec right after start(), before the container is up, runs once it
+    // is: the start is waited out, never refused.
+    await check("exec_while_starting", async () => {
+      c.start({ image, enableInternet: false });
+      const p = await c.exec(["true"]);
+      return expect((await p.exitCode) === 0, "exit 0");
+    });
+    await stop();
     await check("start", async () => {
       c.start({
         image,
