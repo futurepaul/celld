@@ -8,8 +8,10 @@ the node's secrets backend, which the node's operator names. The Worker never
 sees the backend's credentials: they are the node's configuration, not the
 Worker's variables, and the host reads the secret outside every isolate. A read
 that fails rejects naming the backend and its address (for example "OpenBao at
-https://bao.internal:8200 is not answering"), so its operator can tell why; no
-error names a token or a value.
+https://bao.internal:8200 is not answering"), so its operator can tell why.
+celld's own errors never name a token, a value, or what a refused setting
+held; a refusal from OpenBao is passed on as OpenBao said it (its first error,
+cut to 200 characters).
 
 ## Example
 

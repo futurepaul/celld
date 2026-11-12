@@ -229,7 +229,9 @@ fn string_field<'a>(config: &'a serde_json::Map<String, Value>, key: &str) -> an
 
 impl Backend {
     /// The backend `text` (a secrets file's contents, read from `file`)
-    /// names, or why it is refused.
+    /// names, or why it is refused. A refusal names the setting and what it
+    /// takes, never what it held: a token put in the wrong field would
+    /// otherwise reach the node's log.
     pub fn parse(text: &[u8], file: &Path) -> anyhow::Result<Backend> {
         let parsed: Value = serde_json::from_slice(text).map_err(|e| anyhow!("{VARIABLE} {} is not JSON: {e}", file.display()))?;
         let Value::Object(config) = parsed else {
@@ -238,7 +240,7 @@ impl Backend {
         let known: &[&str] = match string_field(&config, "backend")? {
             Some("vars") => &["backend", "values"],
             Some("openbao") => &["backend", "addr", "mount", "prefix", "namespace", "token", "token_file"],
-            Some(other) => bail!("{VARIABLE}'s backend is openbao or vars, not {other:?}"),
+            Some(_) => bail!("{VARIABLE}'s backend is openbao or vars"),
             None => bail!("{VARIABLE} names its backend (`\"backend\": \"openbao\"`, or `\"vars\"` for `celld dev`)"),
         };
         let unknown: Vec<&str> = config.keys().map(String::as_str).filter(|k| !known.contains(k)).collect();
@@ -255,7 +257,7 @@ impl Backend {
             let mut values = BTreeMap::new();
             for (name, value) in given {
                 if !valid_secret_name(name) {
-                    bail!("{VARIABLE} names a secret {name:?}: a name is at most {NAME_MAX_BYTES} letters, digits, `-` and `_`");
+                    bail!("{VARIABLE} names a secret by what is no name: a name is at most {NAME_MAX_BYTES} letters, digits, `-` and `_`");
                 }
                 let Value::String(value) = value else {
                     bail!("{VARIABLE}'s value of {name} is a string");
@@ -269,17 +271,17 @@ impl Backend {
         }
         let addr = string_field(&config, "addr")?.unwrap_or_default();
         if !origin(addr) {
-            bail!("{VARIABLE}'s addr is OpenBao's origin (https://vault.example:8200, no path), not {addr:?}");
+            bail!("{VARIABLE}'s addr is OpenBao's origin (https://vault.example:8200, no path)");
         }
         let mount = string_field(&config, "mount")?.unwrap_or_default();
         if !segments(mount) {
-            bail!("{VARIABLE}'s mount is a KV v2 mount's path, not {mount:?}");
+            bail!("{VARIABLE}'s mount is a KV v2 mount's path");
         }
         let optional = |key: &str| -> anyhow::Result<Option<String>> {
             match string_field(&config, key)? {
                 None => Ok(None),
                 Some(v) if segments(v) => Ok(Some(v.to_string())),
-                Some(v) => bail!("{VARIABLE}'s {key}, when set, is a path, not {v:?}"),
+                Some(_) => bail!("{VARIABLE}'s {key}, when set, is a path"),
             }
         };
         let prefix = optional("prefix")?;
@@ -292,7 +294,7 @@ impl Backend {
                 token_from(Path::new(path))?;
                 Token::File(PathBuf::from(path))
             }
-            (None, Some(path)) => bail!("{VARIABLE}'s token_file is an absolute path, not {path:?}"),
+            (None, Some(_)) => bail!("{VARIABLE}'s token_file is an absolute path, not a relative one"),
             (Some(_), Some(_)) => bail!("{VARIABLE} names OpenBao's token or its token_file, not both"),
             (None, None) => bail!("{VARIABLE}'s backend openbao reads with a token: name its `token_file` (or its `token`)"),
         };

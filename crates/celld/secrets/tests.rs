@@ -258,10 +258,10 @@ fn a_wrong_config_is_refused_saying_what() {
         (bao(json!({ "token": null, "token_file": "/nonexistent/cell.token" })), "the OpenBao token file /nonexistent/cell.token"),
         (json!({ "backend": "vars", "addr": a, "values": {} }), "takes backend, values, not addr"),
         (json!({ "backend": "vars" }), "holds its `values`"),
-        (json!({ "backend": "vars", "values": { "a b": "x" } }), "names a secret \"a b\""),
+        (json!({ "backend": "vars", "values": { "a b": "x" } }), "names a secret by what is no name"),
         (json!({ "backend": "vars", "values": { "x": "" } }), "value of x is 1 to 65536 bytes"),
         (json!({ "backend": "vars", "values": { "x": 3 } }), "value of x is a string"),
-        (json!({ "backend": "file" }), "openbao or vars, not \"file\""),
+        (json!({ "backend": "file" }), "openbao or vars"),
         (json!({ "values": {} }), "names its backend"),
         (json!([]), "holds an object"),
     ];
@@ -286,6 +286,14 @@ fn a_malformed_credential_is_refused_without_its_value() {
         (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token_file": [secret] }), "`token_file` is a string, not an array"),
         (json!({ "backend": [secret] }), "`backend` is a string, not an array"),
         (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token": 7 }), "`token` is a string, not a number"),
+        // a token put in the wrong field, as a string: refused, never echoed
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token_file": secret }), "token_file is an absolute path"),
+        (json!({ "backend": "openbao", "addr": secret, "mount": "fragment", "token": "s.tok" }), "addr is OpenBao's origin"),
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "a/../b", "token": "s.tok", "namespace": format!("../{secret}") }), "mount is a KV v2 mount's path"),
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token": "s.tok", "prefix": format!("../{secret}") }), "prefix, when set, is a path"),
+        (json!({ "backend": "openbao", "addr": "http://127.0.0.1:9", "mount": "fragment", "token": "s.tok", "namespace": format!("../{secret}") }), "namespace, when set, is a path"),
+        (json!({ "backend": secret }), "openbao or vars"),
+        (json!({ "backend": "vars", "values": { format!("{secret} x"): "v" } }), "names a secret by what is no name"),
     ];
     for (config, says) in &cases {
         let e = format!("{:#}", Backend::parse(config.to_string().as_bytes(), Path::new("/s.json")).expect_err(says));
