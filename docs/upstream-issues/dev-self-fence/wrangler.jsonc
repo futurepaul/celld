@@ -1,0 +1,3 @@
+{ "name": "alarm", "main": "index.js", "compatibility_date": "2026-01-01", "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "CLOCK", "class_name": "Clock" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Clock"] }] }

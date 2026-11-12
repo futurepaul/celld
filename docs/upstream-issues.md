@@ -37,8 +37,11 @@ checked against v0.6.3 (2026-10-22).
   before killing it.
 - **`celld dev` halts itself on one slow lease renewal.** A single node,
   with no peers to hand cells to, still renews a 10 s node lease every
-  ~3.3 s, and one renewal that stalled past its 2.5 s timeout (the box
-  was busy) fenced the node ("SELF-FENCE: node lease not renewed within
+  ~3.3 s, and one renewal that stalled past its 2.5 s timeout (its disk
+  was busy: writeback holds every call on the dev store's SQLite file,
+  not a starved thread; measured, with a repro, in
+  `upstream-issues/dev-self-fence.md`, 2026-11-11) fenced the node
+  ("SELF-FENCE: node lease not renewed within
   TTL", exit 3), taking the whole dev stack down. No setting lengthens the
   lease. Seen on v0.6.3, 2026-10-22.
 - **A private CA reaches only `fetch`.** Stock celld trusts
