@@ -56,6 +56,15 @@ the same process as the peer client, so a network firewall cannot keep them
 off the private network. Set `CELLD_EGRESS_PUBLIC_ONLY=1` to refuse
 non-public destinations on all three, checked after a name is resolved; the
 connection goes to the addresses that were checked.
+With it set, an address of the node's own is refused too, however public:
+a Worker never reaches its own node's listeners, by a global address
+either. `CELLD_EGRESS_ALLOW` opens named internal hosts beside it (an
+organization's intranet). It never opens loopback, link-local, unspecified,
+multicast or broadcast addresses or `localhost`, and a name it marks `!` is
+refused whatever it resolves to, a public address included. Another node's
+internal listener stays shut unless a listed network holds that node's
+address: list the intranet's hosts and networks, never the fleet's private
+network.
 
 A root in `CELLD_EXTRA_CA_FILE` can vouch for any host name that a Worker
 reaches, as a root in the bundled Mozilla store can. Add only a CA that you
