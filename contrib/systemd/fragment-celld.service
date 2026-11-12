@@ -1,0 +1,84 @@
+# celld for a self-hosted Fragment, as its own locked-down user.
+# contrib/systemd/README.md says what each setting buys and why the few that
+# are off are off; install.sh installs it.
+[Unit]
+Description=celld, the Workers runtime of a self-hosted Fragment
+Documentation=https://github.com/futurepaul/celld/blob/selfhost/contrib/systemd/README.md
+Wants=network-online.target
+After=network-online.target sandcastle-engine.service
+
+[Service]
+Type=simple
+User=fragment-celld
+Group=fragment-celld
+# Operator settings: listen address, the engine socket, celld's tuning.
+EnvironmentFile=/etc/fragment-celld/celld.env
+Environment=HOME=/var/lib/fragment-celld NO_COLOR=1 CELLD_ESBUILD=/usr/local/lib/fragment-celld/esbuild
+# The cell's Worker project (/opt/fragment/cell) is read-only. Its state,
+# PROJECT/.celld, is a symlink (install.sh makes it) to the state directory,
+# not a mount: celld hands the engine socket paths under it, and the engine
+# resolves them outside this unit's mount namespace.
+WorkingDirectory=/opt/fragment/cell
+ExecStart=/usr/local/lib/fragment-celld/celld dev /opt/fragment/cell/${CELLD_CONFIG} --host ${CELLD_HOST} --port ${CELLD_PORT} --logs --no-watch
+StateDirectory=fragment-celld fragment-celld/cell
+StateDirectoryMode=0700
+UMask=0077
+# celld dev stops on SIGINT; the stop bound is above celld's own 40 s.
+KillSignal=SIGINT
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+# V8's sandbox, if it is ever on, reserves ~1 TB of address space.
+LimitAS=infinity
+
+# No privilege: no capabilities, none gained through exec.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=yes
+RestrictSUIDSGID=yes
+
+# The filesystem is read-only but for the state directory; no /home, a
+# private /tmp, no devices, no host IPC, and /proc shows only celld's
+# processes. Not ProcSubset=pid: it hides /proc/meminfo, from which celld
+# sizes its memory-pressure threshold when no MemoryMax= applies.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+RemoveIPC=yes
+KeyringMode=private
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# Sockets: the engine's (AF_UNIX), loopback services and the internet (AF_INET,
+# AF_INET6). celld makes no namespaces and needs no realtime scheduling.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# System calls: what a service uses, plus memory protection keys, which V8
+# uses to guard its pointer tables (x86 PKU; refused, V8 quietly runs without
+# them); never privileged ones or ones that change resource limits or
+# scheduling. A refused call fails with EPERM.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @pkey
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# Off on purpose: V8's JIT (and WebAssembly) writes machine code and then
+# makes it executable, which MemoryDenyWriteExecute forbids (V8 stops with
+# a fatal error when it creates the first isolate).
+MemoryDenyWriteExecute=no
+
+[Install]
+WantedBy=multi-user.target

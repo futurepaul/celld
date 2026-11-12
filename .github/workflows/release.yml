@@ -38,13 +38,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Only targets with a pinned V8 archive (.cargo/config.toml); celld's
+        # build refuses the others (docs/v8.md).
         include:
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-          - runner: macos-14
-            target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -136,9 +134,7 @@ jobs:
           cp LICENSE NOTICE assets/
           cd assets
           for target in \
-            x86_64-unknown-linux-gnu \
-            aarch64-unknown-linux-gnu \
-            aarch64-apple-darwin; do
+            x86_64-unknown-linux-gnu; do
             test -f "celld-$target.gz"
           done
 
@@ -195,13 +191,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # amd64 only: arm64 has no pinned V8 archive (docs/v8.md).
         include:
           - runner: ubuntu-22.04
             platform: linux/amd64
             suffix: amd64
-          - runner: ubuntu-22.04-arm
-            platform: linux/arm64
-            suffix: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -287,8 +281,7 @@ jobs:
             --tag "$IMAGE:${{ github.event.release.tag_name }}" \
             --tag "$IMAGE:$CELLD_VERSION" \
             --tag "$IMAGE:latest" \
-            "$IMAGE:$TAG_SHA-amd64" \
-            "$IMAGE:$TAG_SHA-arm64"
+            "$IMAGE:$TAG_SHA-amd64"
 
       - name: Resolve manifest digest
         id: digest

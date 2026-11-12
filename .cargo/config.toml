@@ -1,0 +1,18 @@
+# celld links V8 from our own rusty_v8 build, not denoland's prebuilt
+# archive. tools/v8/rusty-v8.sh pin writes this file; docs/v8.md says why.
+#
+# The v8 build script fetches RUSTY_V8_ARCHIVE and checks it against
+# RUSTY_V8_ARCHIVE_SHA256 before use. It compiles the binding at
+# RUSTY_V8_SRC_BINDING_PATH, the crate's own (from the .crate Cargo.lock
+# checks) kept here in v8/, and neither downloads nor writes one.
+# crates/celld/build.rs checks that file against CELLD_V8_BINDING_SHA256,
+# refuses the variables that would bring other V8 code in (a binding mirror
+# or URL; trybuild; a source or debug build), and any target but x86_64-unknown-linux-gnu,
+# the only one with an archive. Every value is forced over the environment.
+[env]
+CELLD_V8_VERSION = { value = "15.2.124.45", force = true }
+RUSTY_V8_ARCHIVE = { value = "https://github.com/futurepaul/celld/releases/download/rusty_v8-v152.2.0-v8-15.2.124.45/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz", force = true }
+RUSTY_V8_ARCHIVE_SHA256 = { value = "1564d947890a0a96fd45e22800f8eaeee5a27b99796667fcf94be8454ddda678", force = true }
+RUSTY_V8_SRC_BINDING_PATH = { value = ".cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs", relative = true, force = true }
+CELLD_V8_BINDING_SHA256 = { value = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5", force = true }
+RUSTY_V8_SKIP_DOWNLOAD = { value = "0", force = true }

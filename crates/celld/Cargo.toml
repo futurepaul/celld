@@ -97,6 +97,10 @@ webpki-roots.workspace = true
 libc.workspace = true
 nix.workspace = true
 
+[build-dependencies]
+# build.rs hashes the pinned v8 binding.
+sha2.workspace = true
+
 [dev-dependencies]
 lz4_flex.workspace = true
 rcgen.workspace = true

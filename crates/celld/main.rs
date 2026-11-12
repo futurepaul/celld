@@ -3567,7 +3567,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 ""
             };
             celld::cli_output::Output::new(celld::cli_output::Format::Text)
-                .line(format_args!("celld {}{profile}", env!("CARGO_PKG_VERSION")))?;
+                .line(format_args!(
+                    "celld {}{profile} (V8 {})",
+                    env!("CARGO_PKG_VERSION"),
+                    v8::V8::get_version()
+                ))?;
             return Ok(());
         }
         Action::Diagnose {

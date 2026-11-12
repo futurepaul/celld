@@ -1,0 +1,72 @@
+name: Fresh build
+
+# celld builds on a machine that has never built it: an empty Cargo cache,
+# as an operator's first build, a release runner or a container build has.
+# Then the V8 binding pin holds there (docs/v8.md): the v8 crate compiles
+# the repository's binding, not the extracted crate's, and a changed
+# repository binding fails the build, naming it. No cache action, on purpose.
+on:
+  pull_request:
+  push:
+    branches:
+      - selfhost
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fresh-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.98.1
+
+jobs:
+  fresh-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Toolchain, and an empty Cargo cache
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          home=${CARGO_HOME:-$HOME/.cargo}
+          rm -rf "$home/registry" "$home/git"
+          echo "CARGO_REGISTRY_SRC=$home/registry/src" >> "$GITHUB_ENV"
+
+      - name: Build celld
+        run: cargo build --locked -p celld
+
+      - name: celld links the pinned V8
+        run: |
+          set -euo pipefail
+          v8=$(sed -n 's/^CELLD_V8_VERSION = { value = "\([^"]*\)".*/\1/p' .cargo/config.toml)
+          target/debug/celld --version | tee /dev/stderr | grep -F "(V8 $v8-rusty)"
+
+      - name: A poisoned extracted crate is never compiled
+        run: |
+          set -euo pipefail
+          extracted=$(find "$CARGO_REGISTRY_SRC" -path '*/v8-*/gen/src_binding_release_x86_64-unknown-linux-gnu.rs' | head -1)
+          test -n "$extracted"
+          echo "// fresh-build: tampered" >> "$extracted"
+          cargo build --locked -p celld
+          grep -h '^cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH=' target/debug/build/v8-*/output |
+            tee /dev/stderr | grep -F "=$PWD/.cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs"
+
+      - name: A changed pinned binding fails the build, naming it
+        run: |
+          set -euo pipefail
+          pinned=$PWD/.cargo/v8/src_binding_release_x86_64-unknown-linux-gnu.rs
+          echo "// fresh-build: tampered" >> "$pinned"
+          if cargo build --locked -p celld > build.log 2>&1; then
+            echo "::error::celld built with a changed v8 binding"
+            exit 1
+          fi
+          grep -F "the v8 binding $pinned is not the pinned one" build.log
+          git checkout -- "$pinned"
+          cargo build --locked -p celld
+          target/debug/celld --version
