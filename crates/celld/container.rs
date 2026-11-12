@@ -511,20 +511,39 @@ pub enum EngineChoice {
     /// The krun engine's API socket (`krun:<path>`); its `ports.sock` is
     /// beside it.
     Krun(PathBuf),
+    /// No engine (`none`): the node runs no container. A deployment may
+    /// still declare `containers`, as a Worker written for Cloudflare does:
+    /// its classes' objects activate with a `ctx.container` that never runs,
+    /// whose `start()` throws "this node runs no computers", and the deploy
+    /// builds no image for them.
+    None,
 }
 
 impl EngineChoice {
     pub fn parse(value: Option<&str>) -> anyhow::Result<EngineChoice> {
         match value.filter(|v| !v.is_empty()) {
             None | Some("docker") => Ok(EngineChoice::Docker),
+            Some("none") => Ok(EngineChoice::None),
             Some(v) => match v.strip_prefix("krun:") {
                 Some(path) if path.starts_with('/') => Ok(EngineChoice::Krun(PathBuf::from(path))),
                 _ => Err(anyhow!(
-                    "CELLD_CONTAINER_ENGINE is `docker` or `krun:<absolute path of the engine's socket>`"
+                    "CELLD_CONTAINER_ENGINE is `docker`, `krun:<absolute path of the engine's socket>` or `none`"
                 )),
             },
         }
     }
+}
+
+/// Whether this node runs containers: `CELLD_CONTAINER_ENGINE` names an
+/// engine (`docker`, the default, or `krun:`), not `none`. Read from the
+/// node's configuration once `configure` has run, and from the variable
+/// before (a deploy, which builds no image for a node that runs none).
+pub fn runs_containers() -> bool {
+    let configured = CONFIG.read().unwrap().as_ref().map(|config| config.choice.clone());
+    let choice = configured.unwrap_or_else(|| {
+        EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref()).unwrap_or(EngineChoice::Docker)
+    });
+    choice != EngineChoice::None
 }
 
 /// What the runtime told this module about the node: set once at start.
@@ -646,6 +665,7 @@ pub async fn engine() -> anyhow::Result<Arc<ContainerEngine>> {
                     crate::container_krun::KrunBackend::new(socket, &node, &data_dir, runtime_manager)
                         .await?,
                 ),
+                EngineChoice::None => anyhow::bail!("this node runs no computers"),
             };
             Ok(Arc::new(ContainerEngine::connect(backend, node, bucket).await?))
         })
@@ -681,6 +701,9 @@ pub async fn shutdown() {
 /// engine still serves every other class, and the container class fails
 /// at its first `start()` with the same message.
 pub async fn prewarm() {
+    if !runs_containers() {
+        return;
+    }
     let engine = match engine().await {
         Ok(engine) => engine,
         Err(error) => {
@@ -1377,8 +1400,10 @@ mod tests {
             EngineChoice::parse(Some("krun:/var/lib/e/engine.sock")).unwrap(),
             EngineChoice::Krun("/var/lib/e/engine.sock".into())
         );
+        assert_eq!(EngineChoice::parse(Some("none")).unwrap(), EngineChoice::None);
         assert!(EngineChoice::parse(Some("krun:relative.sock")).is_err());
         assert!(EngineChoice::parse(Some("podman")).is_err());
+        assert!(EngineChoice::parse(Some("None")).is_err(), "the spelling is exact");
     }
 
     #[test]

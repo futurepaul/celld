@@ -1995,6 +1995,10 @@ pub struct WorkerConfig {
     /// The target runs in this process; see [[service-bindings]].
     services: Vec<(String, String, Option<String>)>,
     asset_binding: Option<String>,
+    /// fork: bindings of the Cloudflare services a node has no part of
+    /// (`secrets_store_secrets`, `send_email`, `images`, `browser`, `ai`),
+    /// by `env` name; see [`StandIn`].
+    stand_ins: Vec<(String, StandIn)>,
     /// `env` names of the Worker Loader bindings, if this Worker can spawn
     /// dynamic isolates. A config can declare more than one loader, and each
     /// binding gets a cache of its own, so a name loaded through one loader
@@ -2145,6 +2149,7 @@ impl WorkerConfig {
             compat,
             services: Vec::new(),
             asset_binding: None,
+            stand_ins: Vec::new(),
             loader_bindings: Vec::new(),
             egress: EgressPolicy::Allow,
             loader_env: None,
@@ -2250,6 +2255,78 @@ impl WorkerConfig {
     pub fn with_asset_binding(mut self, binding: Option<String>) -> Self {
         self.asset_binding = binding;
         self
+    }
+
+    /// Declare its bindings of the services a node does not run.
+    pub fn with_stand_ins(mut self, stand_ins: Vec<(String, StandIn)>) -> Self {
+        self.stand_ins = stand_ins;
+        self
+    }
+}
+
+/// fork: a binding of a Cloudflare service celld does not run, bound with
+/// workerd's class (harness.js), so that a Worker written for Cloudflare
+/// finds it as it would there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StandIn {
+    /// `secrets_store_secrets`: a `Fetcher` whose `get()` reads the secret
+    /// of this name from the node's secrets backend (secrets.rs).
+    SecretsStoreSecret { secret_name: String },
+    /// `send_email`: a `SendEmail` whose sends reject `E_NO_MAILER`.
+    SendEmail,
+    /// `images`: an `ImagesBindingImpl` whose outputs reject.
+    Images,
+    /// `browser`: a `Fetcher` whose fetches reject.
+    Browser,
+    /// `ai`: an `Ai` whose runs reject.
+    Ai,
+}
+
+impl StandIn {
+    /// The manifest binding `binding` (Wrangler's upload metadata) as a
+    /// stand-in, with its `env` name; `None` for every other kind, and an
+    /// error for one of these kinds that is malformed (its names go into
+    /// the harness's source).
+    pub fn from_metadata(binding: &serde_json::Value) -> anyhow::Result<Option<(String, StandIn)>> {
+        let kind = binding.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        if !matches!(kind, "secrets_store_secret" | "send_email" | "images" | "browser" | "ai") {
+            return Ok(None);
+        }
+        let name = binding
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$'))
+            .ok_or_else(|| anyhow!("a {kind} binding of the deployment has no valid name: {binding}"))?
+            .to_string();
+        let stand_in = match kind {
+            "secrets_store_secret" => StandIn::SecretsStoreSecret {
+                secret_name: binding
+                    .get("secret_name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|secret| crate::secrets::valid_secret_name(secret))
+                    .ok_or_else(|| anyhow!("the secrets store binding {name} names no valid secret_name"))?
+                    .to_string(),
+            },
+            "send_email" => StandIn::SendEmail,
+            "images" => StandIn::Images,
+            "browser" => StandIn::Browser,
+            _ => StandIn::Ai,
+        };
+        Ok(Some((name, stand_in)))
+    }
+
+    /// The harness's maker of this binding, as one line of `build_env`'s
+    /// snippet: `__celld.__make…(…)`.
+    fn maker(&self) -> String {
+        match self {
+            StandIn::SecretsStoreSecret { secret_name } => {
+                format!("__celld.__makeSecretsStoreSecret({secret_name:?})")
+            }
+            StandIn::SendEmail => "__celld.__makeSendEmail()".to_string(),
+            StandIn::Images => "__celld.__makeImages()".to_string(),
+            StandIn::Browser => "__celld.__makeBrowser()".to_string(),
+            StandIn::Ai => "__celld.__makeAi()".to_string(),
+        }
     }
 }
 
@@ -7028,6 +7105,7 @@ ops! { OP_NAMES, install_op_functions,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
         "__op_fetch" => op_fetch,
+        "__secret_get" => op_secret_get,
         "__r2_head" => r2_ops::op_r2_head,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
@@ -7163,6 +7241,26 @@ fn op_kv_blob(
 }
 
 /// Create a JS promise for an async op `id` and return it to JS.
+/// fork: `__secret_get(secretName)`, a `secrets_store_secrets` binding's
+/// `get()`. Resolves to `{"value"}`, or to `{"code", "message"}` saying why
+/// the node's secrets backend has none (secrets.rs); the harness throws the
+/// latter. The backend and its credentials stay in this process. No value
+/// is logged.
+fn op_secret_get(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = args.get(0).to_rust_string_lossy(scope);
+    let id = asyncrt::enqueue(async move {
+        Ok::<_, String>(match crate::secrets::read(&name).await {
+            Ok(value) => serde_json::json!({ "value": value }).to_string(),
+            Err(failure) => serde_json::json!({ "code": failure.code, "message": failure.message }).to_string(),
+        })
+    });
+    rv.set(promise_for(scope, id));
+}
+
 fn promise_for<'s>(scope: &mut v8::PinScope<'s, '_>, id: u64) -> v8::Local<'s, v8::Value> {
     let resolver = v8::PromiseResolver::new(scope).unwrap();
     let promise = resolver.get_promise(scope);

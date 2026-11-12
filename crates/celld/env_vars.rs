@@ -321,6 +321,8 @@ pub fn validate() -> anyhow::Result<()> {
     crate::egress::validate()?;
     // Reads and checks the bundle, and keeps it for the TLS clients.
     crate::tls_roots::load()?;
+    // Reads and checks the node's secrets backend (`CELLD_SECRETS_FILE`).
+    crate::secrets::load()?;
     Ok(())
 }
 

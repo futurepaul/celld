@@ -556,6 +556,7 @@ impl Generation {
                 loader_bindings,
                 assets: resolver,
                 services,
+                stand_ins,
                 crons,
                 containers,
                 fence_image: fence,
@@ -571,6 +572,7 @@ impl Generation {
                 WorkerConfig::new(options)
                     .with_services(services)
                     .with_asset_binding(asset_binding)
+                    .with_stand_ins(stand_ins)
                     .with_loaders(loader_bindings)
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })

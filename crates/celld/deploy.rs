@@ -19,8 +19,8 @@ use crate::protocol::{
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
     FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
-    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_SECRETS_STORE_V1, FEATURE_SERVICE_STAND_INS_V1, FEATURE_SQLITE_VEC_V1,
+    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -61,7 +61,23 @@ const SUPPORTED_KEYS: &[&str] = &[
     "no_bundle",
     "define",
     "rules",
+    "secrets_store_secrets",
+    "send_email",
+    "images",
+    "browser",
+    "ai",
 ];
+
+/// The most `secrets_store_secrets` one config binds: a Worker's, with room.
+pub const SECRETS_STORE_SECRETS_MAX: usize = 128;
+/// A store secret's name: the Secrets Store's own rule.
+const SECRET_NAME_MAX_BYTES: usize = 255;
+/// A store's id, as the config names it (Cloudflare's are 32 hex digits).
+const STORE_ID_MAX_BYTES: usize = 128;
+/// The most `send_email` bindings one config declares, and the addresses
+/// each may list.
+const SEND_EMAIL_BINDINGS_MAX: usize = 32;
+const SEND_EMAIL_ADDRESSES_MAX: usize = 256;
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
 /// runtime, not by the worker, so a config naming it in `durable_objects` or
@@ -323,6 +339,8 @@ struct Project {
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
     has_r2: bool,
+    /// Its bindings of the Cloudflare services a node does not run.
+    stand_ins: StandIns,
     containers: Vec<ContainerDecl>,
     /// Set when `main` is a `.py` file: the Python behavior its
     /// compatibility date and flags select.
@@ -617,16 +635,23 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let platform = (!options.local_images).then(|| {
         std::env::var("CELLD_CONTAINER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string())
     });
+    // A deployment for nodes that run no container
+    // (`CELLD_CONTAINER_ENGINE=none`) keeps its classes, whose objects get a
+    // `ctx.container` that never runs, and builds, pulls and saves no image:
+    // `ctx.container.images` is empty there.
+    let runs_containers = crate::container::runs_containers();
     let mut container_specs: Vec<ContainerSpec> = Vec::new();
     for decl in &project.containers {
         let image = decl
             .image
             .as_deref()
+            .filter(|_| runs_containers)
             .map(|image| resolve_image(&root, image, platform.as_deref()))
             .transpose()?;
         let images = decl
             .images
             .iter()
+            .filter(|_| runs_containers)
             .map(|(name, image)| {
                 Ok((
                     name.clone(),
@@ -666,7 +691,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         crate::container::EngineChoice::parse(std::env::var("CELLD_CONTAINER_ENGINE").ok().as_deref()),
         Ok(crate::container::EngineChoice::Krun(_))
     );
-    let fence_image = (!container_specs.is_empty() && !krun)
+    let fence_image = (!container_specs.is_empty() && !krun && runs_containers)
         .then(|| resolve_fence_image(platform.as_deref()))
         .transpose()?;
     let started = Instant::now();
@@ -790,6 +815,12 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if python_runtime {
                 features.push(FEATURE_PYTHON_WORKERS_V1.to_string());
+            }
+            if project.stand_ins.secrets > 0 {
+                features.push(FEATURE_SECRETS_STORE_V1.to_string());
+            }
+            if project.stand_ins.services > 0 {
+                features.push(FEATURE_SERVICE_STAND_INS_V1.to_string());
             }
             features
         },
@@ -2014,6 +2045,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             "name": binding,
         }));
     }
+    let stand_ins = read_stand_ins(object, &mut bindings)?;
     let mut vars = BTreeMap::new();
     match object.get("vars") {
         None => {}
@@ -2079,7 +2111,9 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             || service_count > 0
             || declared_vars
             || !r2_binding_names.is_empty()
-            || !worker_loaders.is_empty())
+            || !worker_loaders.is_empty()
+            || stand_ins.secrets > 0
+            || stand_ins.services > 0)
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }
@@ -2149,9 +2183,146 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
+        stand_ins,
         containers,
         python,
     })
+}
+
+/// How many bindings of the Cloudflare services celld does not run a config
+/// declares (`read_stand_ins`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StandIns {
+    /// `secrets_store_secrets`: read from the node's secrets backend.
+    secrets: usize,
+    /// `send_email`, `images`, `browser` and `ai`: bound, rejecting.
+    services: usize,
+}
+
+/// The keys of an entry that celld models, or the first one it does not.
+fn only_keys(entry: &Map<String, Value>, keys: &[&str], what: &str) -> anyhow::Result<()> {
+    if let Some(key) = entry.keys().find(|key| !keys.contains(&key.as_str())) {
+        bail!("{what} declares `{key}`, which celld does not model; celld models `{}`", keys.join("`, `"));
+    }
+    Ok(())
+}
+
+/// A string field of `entry`, present and not empty.
+fn required_string<'a>(entry: &'a Map<String, Value>, key: &str, what: &str) -> anyhow::Result<&'a str> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{what} has no `{key}` string"))
+}
+
+/// The bindings of Cloudflare services a node has no part of, declared as
+/// Wrangler declares them, each pushed onto `bindings` as Wrangler's upload
+/// metadata spells it, so a Worker written for Cloudflare deploys here as it
+/// is:
+///
+/// - `secrets_store_secrets`: each `{binding, store_id, secret_name}`, read
+///   from the node's secrets backend by `secret_name` (secrets.rs). The
+///   store id is kept, and a node has one store.
+/// - `send_email`, `images`, `browser` and `ai`: bound with workerd's
+///   classes, every call rejecting, saying the node has no such service
+///   (harness.js).
+///
+/// Each key celld does not model stops the deploy, per the loud-gap rule.
+fn read_stand_ins(object: &Map<String, Value>, bindings: &mut Vec<Value>) -> anyhow::Result<StandIns> {
+    let mut counts = StandIns::default();
+    let secrets = match object.get("secrets_store_secrets") {
+        None => &[][..],
+        Some(Value::Array(secrets)) => secrets.as_slice(),
+        Some(_) => bail!("config `secrets_store_secrets` must be an array"),
+    };
+    if secrets.len() > SECRETS_STORE_SECRETS_MAX {
+        bail!("config `secrets_store_secrets` binds {} secrets, more than {SECRETS_STORE_SECRETS_MAX}", secrets.len());
+    }
+    for (index, secret) in secrets.iter().enumerate() {
+        let what = format!("config `secrets_store_secrets[{index}]`");
+        let Value::Object(secret) = secret else {
+            bail!("{what} must be an object");
+        };
+        only_keys(secret, &["binding", "store_id", "secret_name"], &what)?;
+        let binding = required_string(secret, "binding", &what)?;
+        if !valid_binding(binding) {
+            bail!("invalid secrets store binding name: {binding:?}");
+        }
+        let store_id = required_string(secret, "store_id", &what)?;
+        if store_id.len() > STORE_ID_MAX_BYTES || !store_id.bytes().all(|b| b.is_ascii_graphic()) {
+            bail!("{what} `store_id` is at most {STORE_ID_MAX_BYTES} printable ASCII bytes: {store_id:?}");
+        }
+        let secret_name = required_string(secret, "secret_name", &what)?;
+        if !crate::secrets::valid_secret_name(secret_name) {
+            bail!(
+                "{what} `secret_name` is at most {SECRET_NAME_MAX_BYTES} letters, digits, `-` and `_`: {secret_name:?}"
+            );
+        }
+        bindings.push(json!({
+            "type": "secrets_store_secret",
+            "name": binding,
+            "store_id": store_id,
+            "secret_name": secret_name,
+        }));
+        counts.secrets += 1;
+    }
+    let emails = match object.get("send_email") {
+        None => &[][..],
+        Some(Value::Array(emails)) => emails.as_slice(),
+        Some(_) => bail!("config `send_email` must be an array"),
+    };
+    if emails.len() > SEND_EMAIL_BINDINGS_MAX {
+        bail!("config `send_email` declares {} bindings, more than {SEND_EMAIL_BINDINGS_MAX}", emails.len());
+    }
+    for (index, email) in emails.iter().enumerate() {
+        let what = format!("config `send_email[{index}]`");
+        let Value::Object(email) = email else {
+            bail!("{what} must be an object");
+        };
+        only_keys(
+            email,
+            &["name", "destination_address", "allowed_destination_addresses", "allowed_sender_addresses"],
+            &what,
+        )?;
+        let name = required_string(email, "name", &what)?;
+        if !valid_binding(name) {
+            bail!("invalid send_email binding name: {name:?}");
+        }
+        // The restrictions are kept for the node's mailer (a later change):
+        // a node with none sends nothing, so none is in force yet.
+        let mut encoded = json!({ "type": "send_email", "name": name });
+        if let Some(address) = email.get("destination_address") {
+            let address = address.as_str().ok_or_else(|| anyhow!("{what} `destination_address` must be a string"))?;
+            encoded["destination_address"] = json!(address);
+        }
+        for key in ["allowed_destination_addresses", "allowed_sender_addresses"] {
+            let Some(list) = email.get(key) else { continue };
+            let addresses = list
+                .as_array()
+                .filter(|list| list.len() <= SEND_EMAIL_ADDRESSES_MAX && list.iter().all(Value::is_string))
+                .ok_or_else(|| anyhow!("{what} `{key}` must be a list of at most {SEND_EMAIL_ADDRESSES_MAX} strings"))?;
+            encoded[key] = json!(addresses);
+        }
+        bindings.push(encoded);
+        counts.services += 1;
+    }
+    // One binding each, as Wrangler declares them: `{ "binding": NAME }`.
+    for (key, kind) in [("images", "images"), ("browser", "browser"), ("ai", "ai")] {
+        let Some(value) = object.get(key) else { continue };
+        let what = format!("config `{key}`");
+        let Value::Object(entry) = value else {
+            bail!("{what} must be an object with a `binding` name");
+        };
+        only_keys(entry, &["binding"], &what)?;
+        let binding = required_string(entry, "binding", &what)?;
+        if !valid_binding(binding) {
+            bail!("invalid {key} binding name: {binding:?}");
+        }
+        bindings.push(json!({ "type": kind, "name": binding }));
+        counts.services += 1;
+    }
+    Ok(counts)
 }
 
 /// The config's `define` and `rules`, as esbuild arguments.
@@ -3283,4 +3454,71 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+// fork: the bindings of services a node does not run, read as Wrangler
+// declares them.
+#[cfg(test)]
+mod stand_in_tests {
+    use super::*;
+
+    fn read(config: Value) -> anyhow::Result<(StandIns, Vec<Value>)> {
+        let mut bindings = Vec::new();
+        let counts = read_stand_ins(config.as_object().unwrap(), &mut bindings)?;
+        Ok((counts, bindings))
+    }
+
+    // Goal: each key is read into Wrangler's upload metadata, counted for the
+    // features a node must have; each key or value celld does not model stops
+    // the deploy, saying which. Replay: read twice, the same.
+    #[test]
+    fn stand_ins_are_read_as_wrangler_declares_them() {
+        let config = json!({
+            "secrets_store_secrets": [
+                { "binding": "HOST_SECRET", "store_id": "abc123", "secret_name": "fragment-host-secret" },
+                { "binding": "AGAIN", "store_id": "abc123", "secret_name": "fragment-host-secret" }
+            ],
+            "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["a@example.com"] }],
+            "images": { "binding": "IMAGES" },
+            "browser": { "binding": "BROWSER" },
+            "ai": { "binding": "AI" }
+        });
+        for _ in 0..2 {
+            let (counts, bindings) = read(config.clone()).unwrap();
+            assert_eq!(counts, StandIns { secrets: 2, services: 4 });
+            assert_eq!(
+                bindings,
+                [
+                    json!({ "type": "secrets_store_secret", "name": "HOST_SECRET", "store_id": "abc123", "secret_name": "fragment-host-secret" }),
+                    json!({ "type": "secrets_store_secret", "name": "AGAIN", "store_id": "abc123", "secret_name": "fragment-host-secret" }),
+                    json!({ "type": "send_email", "name": "EMAIL", "allowed_sender_addresses": ["a@example.com"] }),
+                    json!({ "type": "images", "name": "IMAGES" }),
+                    json!({ "type": "browser", "name": "BROWSER" }),
+                    json!({ "type": "ai", "name": "AI" }),
+                ]
+            );
+        }
+        assert_eq!(read(json!({})).unwrap(), (StandIns::default(), vec![]));
+        let refused = [
+            (json!({ "secrets_store_secrets": {} }), "must be an array"),
+            (json!({ "secrets_store_secrets": [{ "binding": "A", "store_id": "s" }] }), "has no `secret_name` string"),
+            (json!({ "secrets_store_secrets": [{ "binding": "A", "store_id": "s", "secret_name": "a/b" }] }), "`secret_name` is at most 255"),
+            (json!({ "secrets_store_secrets": [{ "binding": "A-B", "store_id": "s", "secret_name": "a" }] }), "invalid secrets store binding name"),
+            (json!({ "secrets_store_secrets": [{ "binding": "A", "store_id": "s s", "secret_name": "a" }] }), "`store_id` is at most"),
+            (json!({ "secrets_store_secrets": [{ "binding": "A", "store_id": "s", "secret_name": "a", "remote": true }] }), "declares `remote`"),
+            (json!({ "send_email": [{ "name": "E", "allowed_sender_addresses": "a@b" }] }), "must be a list"),
+            (json!({ "send_email": [{ "binding": "E" }] }), "declares `binding`"),
+            (json!({ "images": { "binding": "IMAGES", "remote": true } }), "declares `remote`"),
+            (json!({ "browser": [] }), "must be an object with a `binding` name"),
+            (json!({ "ai": {} }), "has no `binding` string"),
+        ];
+        for (config, says) in refused {
+            let e = read(config).unwrap_err().to_string();
+            assert!(e.contains(says), "{says:?} in {e:?}");
+        }
+        let many: Vec<Value> = (0..=SECRETS_STORE_SECRETS_MAX)
+            .map(|i| json!({ "binding": format!("S{i}"), "store_id": "s", "secret_name": format!("s{i}") }))
+            .collect();
+        assert!(read(json!({ "secrets_store_secrets": many })).unwrap_err().to_string().contains("more than 128"));
+    }
 }
