@@ -402,15 +402,18 @@ EOF
 }
 
 # Build celld and run its tests: against the pin, or against an archive,
-# its SHA-256 and its V8 version ($1..$3), given as cargo --config
-# overrides, which outrank the forced pin without changing it.
+# its SHA-256, its V8 version and the binding that goes with it ($1..$4),
+# given as cargo --config overrides, which outrank the forced pin without
+# changing it.
 celld_test() {
   local target_dir=${CELLD_TARGET_DIR:-$ROOT/target} over=() version v
   version=$(pinned CELLD_V8_VERSION)
-  if (( $# == 3 )); then
+  if (( $# == 4 )); then
     over=(--config "env.RUSTY_V8_ARCHIVE.value=\"$1\"" \
       --config "env.RUSTY_V8_ARCHIVE_SHA256.value=\"$2\"" \
-      --config "env.CELLD_V8_VERSION.value=\"$3\"")
+      --config "env.CELLD_V8_VERSION.value=\"$3\"" \
+      --config "env.RUSTY_V8_SRC_BINDING_PATH.value=\"$4\"" \
+      --config "env.CELLD_V8_BINDING_SHA256.value=\"$(sha256sum "$4" | cut -d' ' -f1)\"")
     version=$3
   fi
   (cd "$ROOT" && CARGO_TARGET_DIR="$target_dir" cargo "${over[@]}" test --profile lab --locked -j "$JOBS")
@@ -420,9 +423,16 @@ celld_test() {
 }
 
 cmd_verify_local() {
-  local dist
+  local dist binding
   dist=$(dist_dir)
-  celld_test "$dist/$ARCHIVE" "$(sha256sum "$dist/$ARCHIVE" | cut -d' ' -f1)" "$(dist_v8 "$dist")"
+  # The binding pin will write: the build's for a commit, else the crate's.
+  binding=$dist/$BINDING
+  if [[ -z $(crate_rev) ]]; then
+    mkdir -p "$dist/crate"
+    binding=$dist/crate/$BINDING
+    crate_binding "$(crate_version)" > "$binding"
+  fi
+  celld_test "$dist/$ARCHIVE" "$(sha256sum "$dist/$ARCHIVE" | cut -d' ' -f1)" "$(dist_v8 "$dist")" "$binding"
 }
 
 cmd_publish() {
