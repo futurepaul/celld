@@ -322,6 +322,9 @@ struct CellState {
     /// `interceptOutbound*` so far, in order: the engine names a match by
     /// its index, and intercepts are only ever added.
     intercepts: Vec<Intercept>,
+    /// fork: how many of `intercepts` (the first ones) the engine holds for
+    /// this run: an `intercept()` answers once its own is among them.
+    installed: usize,
 }
 
 /// Where the node reaches a container's ports.
@@ -382,6 +385,10 @@ pub struct CellContainer {
     /// Written with `send_replace`: a plain `send` discards the value
     /// while nobody subscribes, and `monitor()` usually subscribes late.
     exit: watch::Sender<Option<(u64, Result<RunExit, String>)>>,
+    /// fork: the last run whose start ended: up, with the intercepts set
+    /// while it was under way installed (or tried), or failed, or destroyed
+    /// as it started. An `intercept()` set during a start waits for it.
+    up: watch::Sender<u64>,
     /// fork: held while the intercepts are sent to the engine, each send the
     /// whole list as it is once held, so a send that read fewer never
     /// lands after one that read more (the engine replaces them whole).
@@ -434,6 +441,7 @@ impl CellContainer {
         state.running = true;
         state.address = Address::None;
         state.info = RunInfo::default();
+        state.installed = 0;
         let run = state.run;
         drop(state);
         self.exit.send_replace(None);
@@ -812,6 +820,7 @@ impl ContainerEngine {
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
+                    up: watch::channel(0).0,
                     intercepts_sent: tokio::sync::Mutex::new(()),
                 })
             });
@@ -829,7 +838,13 @@ impl ContainerEngine {
         let adopted = running.is_some() && !cell.running();
         if adopted {
             let run = cell.begin_run();
-            cell.state.lock().unwrap().info.started = true;
+            {
+                let mut state = cell.state.lock().unwrap();
+                state.info.started = true;
+                // fork: an earlier owner installed its intercepts
+                state.installed = state.intercepts.len();
+            }
+            cell.up.send_replace(run);
             self.watch_exit(&cell, run);
         }
         let mut state = cell.state.lock().unwrap();
@@ -955,6 +970,7 @@ impl ContainerEngine {
                 drop(state);
                 cell.exit
                     .send_replace(Some((run, Err(format!("{error:#}")))));
+                cell.up.send_replace(run);
                 return Err(error);
             }
         };
@@ -968,13 +984,16 @@ impl ContainerEngine {
                 state.running = true;
                 state.address = address;
                 state.info.started = true;
+                state.installed = launched;
             }
             (destroyed, state.intercepts.len() > launched)
         };
-        // fork: an intercept the object added while the start was under way
+        // fork: the intercepts the object set while the start was under way
         // (its `start()` returns at once, and an object sets its intercepts
-        // right after, as on Cloudflare) was recorded, not sent: the engine
-        // has it now, or the guest's first request to its host went nowhere.
+        // right after, as on Cloudflare) are installed before the start
+        // counts as up (`up`), which the `intercept()` that set each waits
+        // for: it answers once the engine holds its rule, sending it itself
+        // when this send failed, and so returns that failure.
         if !destroyed && added {
             if let Err(error) = self.send_intercepts(cell).await {
                 tracing::warn!(
@@ -982,10 +1001,11 @@ impl ContainerEngine {
                     cell = %cell.scope,
                     engine = self.backend.kind(),
                     error = %format!("{error:#}"),
-                    "the intercepts added during the start did not reach the engine"
+                    "the intercepts set during the start did not reach the engine"
                 );
             }
         }
+        cell.up.send_replace(run);
         if destroyed {
             self.backend.remove(&cell.name).await;
             cell.exit.send_replace(Some((
@@ -1182,20 +1202,46 @@ impl ContainerEngine {
             "interceptOutboundHttp() is not supported by celld's {} engine",
             self.backend.kind()
         );
-        {
+        let index = {
             let mut state = cell.state.lock().unwrap();
-            if let Some(held) = state.intercepts.iter_mut().find(|i| i.rule == rule) {
-                held.route = route;
-                return Ok(());
+            match state.intercepts.iter().position(|i| i.rule == rule) {
+                Some(index) => {
+                    state.intercepts[index].route = route;
+                    index
+                }
+                None => {
+                    let used: usize = state.intercepts.iter().map(|i| i.rule.entries()).sum();
+                    anyhow::ensure!(
+                        used + rule.entries() <= INTERCEPT_ENTRIES_MAX,
+                        "a container takes at most {INTERCEPT_ENTRIES_MAX} intercept entries (a hostname counts two)"
+                    );
+                    state.intercepts.push(Intercept { rule, route });
+                    state.intercepts.len() - 1
+                }
             }
-            let used: usize = state.intercepts.iter().map(|i| i.rule.entries()).sum();
-            anyhow::ensure!(
-                used + rule.entries() <= INTERCEPT_ENTRIES_MAX,
-                "a container takes at most {INTERCEPT_ENTRIES_MAX} intercept entries (a hostname counts two)"
-            );
-            state.intercepts.push(Intercept { rule, route });
+        };
+        // fork: answered once the engine holds the rule, never before: a
+        // start under way is waited out (it installs what was set meanwhile
+        // before it counts as up), and a rule it did not install is sent
+        // here, its failure returned. A container that is not running holds
+        // none: its next start takes the rule with the rest. Bounded by the
+        // start, which ends either way (`up`).
+        let mut up = cell.up.subscribe();
+        loop {
+            let starting = {
+                let state = cell.state.lock().unwrap();
+                if !state.running || state.installed > index {
+                    return Ok(());
+                }
+                *up.borrow_and_update() < state.run
+            };
+            if !starting {
+                return self.send_intercepts(cell).await;
+            }
+            if up.changed().await.is_err() {
+                return Err(anyhow!("the container engine went away"));
+            }
         }
-        self.send_intercepts(cell).await
     }
 
     /// fork: the container's intercepts, all of them as they are once the
@@ -1206,10 +1252,14 @@ impl ContainerEngine {
         let rules = {
             let state = cell.state.lock().unwrap();
             let running = state.running && state.info.started;
-            running.then(|| state.intercepts.iter().map(|i| i.rule.clone()).collect::<Vec<_>>())
+            running.then(|| (state.run, state.intercepts.iter().map(|i| i.rule.clone()).collect::<Vec<_>>()))
         };
-        if let Some(rules) = rules {
+        if let Some((run, rules)) = rules {
             self.backend.set_intercepts(&cell.name, &rules).await?;
+            let mut state = cell.state.lock().unwrap();
+            if state.run == run {
+                state.installed = state.installed.max(rules.len());
+            }
         }
         Ok(())
     }
