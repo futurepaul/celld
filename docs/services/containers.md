@@ -109,7 +109,8 @@ Cloudflare. The socket is beside the node's data when that path fits a Unix
 socket's 107 bytes, and otherwise in `$XDG_RUNTIME_DIR/celld`, named by a hash
 of the node's data directory. An intercept the object sets while a `start()` is
 under way answers once the engine holds it: the start installs it before the
-container counts as up, and an installation that fails is the call's error. A host intercepted
+container counts as up, in its launch or after it, and an installation that
+fails (a launch the engine refuses included) is the call's error. A host intercepted
 again takes the new binding in its place, counting once toward the 128 entries.
 An `exec()` while a `start()` is under way waits for the container to be up, as
 on Cloudflare, where the engine would refuse it; up includes the intercepts set
@@ -209,8 +210,9 @@ count against `max_instances`. A start over the cap fails, and the node logs
   as the container stops: the node wakes the object with an internal request
   (`http://container.celld.internal/exited`) that the harness answers itself,
   and its `fetch()` never sees. The wake goes past the object's request limit,
-  and is tried again until acknowledged while a watcher of the run is left. Each `monitor()` hears its own run's end, kept
-  for it through a later `start()`.
+  and is tried again until acknowledged while a watcher of the run is left.
+  Each `monitor()` hears its own run's end, kept for it through a later
+  `start()` while the object's instance that called it lives.
 - On macOS, the node reaches a container through a published port, so the image
   must declare the port with `EXPOSE`. `enableInternet: false` has no effect on
   macOS.

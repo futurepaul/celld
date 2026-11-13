@@ -470,9 +470,12 @@ export default {
       const raced = await (await at("/restart/race")).json();
       await sleep(3000);
       const seen = { ...(await (await at("/restart/ended")).json()), raced };
-      restart = seen.ended === "exit 3"
-        ? { ok: true, ms: Date.now() - t1, detail: seen }
-        : { ok: false, ms: Date.now() - t1, error: `expected: ${JSON.stringify(seen)}` };
+      // the race reached: the next start made in the turn that saw the end
+      restart = !raced.inTurn
+        ? { ok: false, ms: Date.now() - t1, error: `the race was not taken in one turn: ${JSON.stringify(raced)}` }
+        : seen.ended === "exit 3"
+          ? { ok: true, ms: Date.now() - t1, detail: seen }
+          : { ok: false, ms: Date.now() - t1, error: `expected: ${JSON.stringify(seen)}` };
     } catch (error) {
       restart = { ok: false, ms: Date.now() - t1, error: error?.message ?? String(error) };
     } finally {
