@@ -208,7 +208,8 @@ count against `max_instances`. A start over the cap fails, and the node logs
   after the handler answers. A `monitor()` whose event has answered settles
   as the container stops: the node wakes the object with an internal request
   (`http://container.celld.internal/exited`) that the harness answers itself,
-  and its `fetch()` never sees. Each `monitor()` hears its own run's end, kept
+  and its `fetch()` never sees. The wake goes past the object's request limit,
+  and is tried again until acknowledged while a watcher of the run is left. Each `monitor()` hears its own run's end, kept
   for it through a later `start()`.
 - On macOS, the node reaches a container through a published port, so the image
   must declare the port with `EXPOSE`. `enableInternet: false` has no effect on

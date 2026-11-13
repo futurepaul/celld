@@ -477,6 +477,11 @@ impl CellContainer {
         run
     }
 
+    /// fork: whether a `monitor()` of `run` has yet to read its outcome.
+    pub fn awaited(&self, run: u64) -> bool {
+        self.outcomes.lock().unwrap().get(&run).is_some_and(|outcome| outcome.watchers > 0)
+    }
+
     /// fork: a `monitor()` of `run` has read its outcome; the outcome goes
     /// once none is left to read it.
     pub fn unwatch(&self, run: u64) {
@@ -785,27 +790,59 @@ pub async fn shutdown() {
 /// `monitor()` watchers whose runs ended.
 pub const CONTAINER_EXITED_URL: &str = "http://container.celld.internal/exited";
 
+/// fork: how many times a container's exit wake is tried, at most, while a
+/// `monitor()` of its run is left to hear it: about two minutes at the
+/// backoff's cap (`WAKE_BACKOFF_MAX`).
+const WAKE_TRIES_MAX: u32 = 30;
+const WAKE_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 /// fork: wakes the object whose container's run ended, so a `monitor()` an
 /// earlier event set, which could not keep that event alive, settles now,
-/// as Cloudflare settles it when the container stops. A failed wake (a
-/// node stopping) leaves it to the object's next event.
-async fn wake_cell(scope: &str) {
+/// as Cloudflare settles it when the container stops. The wake goes past
+/// the object's request admission (`RuntimeManager::notify_cell`): its
+/// handlers in flight may be the ones waiting for it. It is tried again
+/// until the harness acknowledges it (204), while a watcher of the run is
+/// left to hear it and the object is on this node; past `WAKE_TRIES_MAX` it
+/// is left to the object's next event, said.
+async fn wake_cell(cell: &CellContainer, run: u64) {
     let runtime = CONFIG.read().unwrap().as_ref().and_then(|config| config.runtime_manager.clone());
     let Some(runtime) = runtime else {
         return;
     };
-    let wake = crate::engine_api::RuntimeFetch {
-        url: CONTAINER_EXITED_URL.to_string(),
-        method: "POST".to_string(),
-        body: crate::engine_api::RequestBody::Bytes(Bytes::new()),
-        headers: Vec::new(),
-        request_id: None,
-        order: None,
-        parent: None,
-    };
-    if let Err(error) = runtime.fetch_cell(scope.to_string(), None, wake, None).await {
-        tracing::debug!(cell = %scope, error = %format!("{error:#}"), "the container's exit woke no cell");
+    let mut delay = Duration::from_millis(100);
+    // Bounded by WAKE_TRIES_MAX.
+    for tried in 1..=WAKE_TRIES_MAX {
+        if !cell.awaited(run) {
+            return;
+        }
+        let wake = crate::engine_api::RuntimeFetch {
+            url: CONTAINER_EXITED_URL.to_string(),
+            method: "POST".to_string(),
+            body: crate::engine_api::RequestBody::Bytes(Bytes::new()),
+            headers: Vec::new(),
+            request_id: None,
+            order: None,
+            parent: None,
+        };
+        match runtime.notify_cell(cell.scope.clone(), wake).await {
+            Ok(Some(answer)) if answer.status == 204 => return,
+            Ok(None) => return,
+            Ok(Some(answer)) => {
+                tracing::debug!(cell = %cell.scope, tried, status = answer.status, "the container's exit wake was not acknowledged");
+            }
+            Err(error) => {
+                tracing::debug!(cell = %cell.scope, tried, error = %format!("{error:#}"), "the container's exit wake failed");
+            }
+        }
+        asyncrt::sleep(delay).await;
+        delay = (delay * 2).min(WAKE_BACKOFF_MAX);
     }
+    tracing::warn!(
+        event = "container_exit_wake_unacknowledged",
+        cell = %cell.scope,
+        run,
+        "a container's exit wake was not acknowledged: its monitor() settles at the object's next event"
+    );
 }
 
 /// Connect and load every image of the installed specs, ahead of the
@@ -1142,7 +1179,7 @@ impl ContainerEngine {
                 destroyed: exit.destroyed || destroyed,
             });
             cell_.record(run, result);
-            wake_cell(&cell_.scope).await;
+            wake_cell(&cell_, run).await;
         })
         .detach();
     }
