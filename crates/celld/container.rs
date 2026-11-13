@@ -278,6 +278,18 @@ impl InterceptRule {
     }
 }
 
+/// fork: one run's outcome, kept until the `monitor()`s watching it have
+/// read it.
+#[derive(Default)]
+struct Outcome {
+    exit: Option<Result<RunExit, String>>,
+    watchers: u32,
+}
+
+/// fork: the run outcomes a cell keeps, at most; past it the oldest ended
+/// one goes, read or not.
+const OUTCOMES_MAX: usize = 64;
+
 /// Where an intercepted request goes: the binding's route, as
 /// `globalOutbound` keeps one, so it outlives the object's isolate.
 #[derive(Clone, Debug)]
@@ -385,6 +397,9 @@ pub struct CellContainer {
     /// Written with `send_replace`: a plain `send` discards the value
     /// while nobody subscribes, and `monitor()` usually subscribes late.
     exit: watch::Sender<Option<(u64, Result<RunExit, String>)>>,
+    /// fork: each run's outcome, kept until the `monitor()`s that watch it
+    /// have read it (`watch`, `record`, `unwatch`).
+    outcomes: Mutex<BTreeMap<u64, Outcome>>,
     /// fork: the last run whose start ended: up, with the intercepts set
     /// while it was under way installed (or tried), or failed, or destroyed
     /// as it started. An `intercept()` set during a start waits for it.
@@ -445,6 +460,7 @@ impl CellContainer {
         let run = state.run;
         drop(state);
         self.exit.send_replace(None);
+        self.prune_outcomes();
         run
     }
 
@@ -453,19 +469,54 @@ impl CellContainer {
         self.state.lock().unwrap().run
     }
 
-    /// fork: how run `run` ended, once it has, as `monitor()` reads it (an
-    /// exit of `run` or of a later one): its exit, or `Err` for an engine
-    /// failure the wait could not attribute. `None` until then. The run a
-    /// `monitor()` read can be the one before a start whose run opens late
-    /// (`op_container_start`), whose start clears the exit, so its own end
-    /// is the one heard, as `ContainerEngine::monitor` hears it.
+    /// fork: registers a `monitor()` of the current run, whose outcome is
+    /// then kept until it reads it (`unwatch`): the run it means, exactly.
+    pub fn watch(&self) -> u64 {
+        let run = self.current_run();
+        self.outcomes.lock().unwrap().entry(run).or_default().watchers += 1;
+        run
+    }
+
+    /// fork: a `monitor()` of `run` has read its outcome; the outcome goes
+    /// once none is left to read it.
+    pub fn unwatch(&self, run: u64) {
+        let mut outcomes = self.outcomes.lock().unwrap();
+        if let Some(outcome) = outcomes.get_mut(&run) {
+            outcome.watchers = outcome.watchers.saturating_sub(1);
+            if outcome.watchers == 0 && outcome.exit.is_some() {
+                outcomes.remove(&run);
+            }
+        }
+    }
+
+    /// fork: how run `run` ended, once it has: its exit, or `Err` for an
+    /// engine failure the wait could not attribute. `None` until then. Only
+    /// that run's own outcome: a later run's start never clears it, and its
+    /// end never answers for it.
     pub fn ended(&self, run: u64) -> Option<Result<RunExit, String>> {
-        match self.exit.borrow().clone() {
-            Some((ended, result)) if ended >= run => Some(result),
-            _ => None,
+        self.outcomes.lock().unwrap().get(&run).and_then(|outcome| outcome.exit.clone())
+    }
+
+    /// fork: run `run` ended so: its outcome kept for its watchers, and the
+    /// waits on the exit told.
+    fn record(&self, run: u64, exit: Result<RunExit, String>) {
+        self.outcomes.lock().unwrap().entry(run).or_default().exit = Some(exit.clone());
+        self.exit.send_replace(Some((run, exit)));
+    }
+
+    /// fork: the outcomes no watcher will read go (each read, or none
+    /// registered), and past `OUTCOMES_MAX` the oldest ended ones: a
+    /// watcher whose isolate went never reads its own.
+    fn prune_outcomes(&self) {
+        let mut outcomes = self.outcomes.lock().unwrap();
+        outcomes.retain(|_, outcome| outcome.exit.is_none() || outcome.watchers > 0);
+        // Bounded: each pass removes one entry, or stops.
+        while outcomes.len() > OUTCOMES_MAX {
+            let Some(oldest) = outcomes.iter().find(|(_, outcome)| outcome.exit.is_some()).map(|(run, _)| *run) else {
+                break;
+            };
+            outcomes.remove(&oldest);
         }
-        }
-        (self.current_run() > run).then(|| Err("a later start replaced this run".to_string()))
     }
 
     /// `inspect()`: the running container's image and labels, or `None`.
@@ -835,6 +886,7 @@ impl ContainerEngine {
                     state: Mutex::new(CellState::default()),
                     processes: Mutex::new(Vec::new()),
                     exit: watch::channel(None).0,
+                    outcomes: Mutex::new(BTreeMap::new()),
                     up: watch::channel(0).0,
                     intercepts_sent: tokio::sync::Mutex::new(()),
                 })
@@ -983,8 +1035,7 @@ impl ContainerEngine {
                 let mut state = cell.state.lock().unwrap();
                 state.running = false;
                 drop(state);
-                cell.exit
-                    .send_replace(Some((run, Err(format!("{error:#}")))));
+                cell.record(run, Err(format!("{error:#}")));
                 cell.up.send_replace(run);
                 return Err(error);
             }
@@ -1023,13 +1074,13 @@ impl ContainerEngine {
         cell.up.send_replace(run);
         if destroyed {
             self.backend.remove(&cell.name).await;
-            cell.exit.send_replace(Some((
+            cell.record(
                 run,
                 Ok(RunExit {
                     code: 137,
                     destroyed: true,
                 }),
-            )));
+            );
             return Ok(());
         }
         self.watch_exit(cell, run);
@@ -1059,7 +1110,7 @@ impl ContainerEngine {
                 code: exit.code,
                 destroyed: exit.destroyed || destroyed,
             });
-            cell_.exit.send_replace(Some((run, result)));
+            cell_.record(run, result);
         })
         .detach();
     }
@@ -1156,14 +1207,13 @@ impl ContainerEngine {
         Ok((address, launched))
     }
 
-    /// Wait for the current run to end.
+    /// Wait for run `run` to end. fork: that run's own outcome, which a
+    /// later start never clears (`CellContainer::record`).
     pub async fn monitor(&self, cell: &Arc<CellContainer>, run: u64) -> Result<RunExit, String> {
         let mut receiver = cell.exit.subscribe();
         loop {
-            if let Some((ended, result)) = receiver.borrow_and_update().clone() {
-                if ended >= run {
-                    return result;
-                }
+            if let Some(result) = cell.ended(run) {
+                return result;
             }
             if receiver.changed().await.is_err() {
                 return Err("the container engine went away".to_string());
@@ -1484,6 +1534,64 @@ pub(crate) fn node_prefix(node: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_cell() -> CellContainer {
+        CellContainer {
+            scope: "Box:1".into(),
+            name: container_name("node-a", "Box:1"),
+            spec: Arc::new(serde_json::from_value(json!({ "class_name": "Box" })).unwrap()),
+            state: Mutex::new(CellState::default()),
+            processes: Mutex::new(Vec::new()),
+            exit: watch::channel(None).0,
+            outcomes: Mutex::new(BTreeMap::new()),
+            up: watch::channel(0).0,
+            intercepts_sent: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn exit(code: i64) -> Result<RunExit, String> {
+        Ok(RunExit { code, destroyed: false })
+    }
+
+    // Goal (review of the stack, finding 2): a monitor() of a run keeps that
+    // run's outcome through a later start, and never takes the later run's;
+    // an outcome no watcher holds goes at the next start; one read goes; a
+    // watcher whose isolate went cannot hold more than OUTCOMES_MAX. Replay:
+    // read twice, the same outcome.
+    #[test]
+    fn a_run_keeps_its_own_outcome_for_its_watchers() {
+        let cell = a_cell();
+        let first = cell.begin_run();
+        assert_eq!(cell.watch(), first);
+        cell.record(first, exit(137));
+        let second = cell.begin_run();
+        assert_eq!(cell.ended(first), Some(exit(137)), "a later start keeps it");
+        assert_eq!(cell.ended(first), Some(exit(137)), "read again, the same");
+        assert_eq!(cell.ended(second), None, "the new run has not ended");
+        cell.record(second, exit(0));
+        assert_eq!(cell.ended(first), Some(exit(137)), "never the later run's");
+        cell.unwatch(first);
+        assert_eq!(cell.ended(first), None, "read by its only watcher: gone");
+        // the second's outcome, watched by no one, goes at the next start
+        assert_eq!(cell.ended(second), Some(exit(0)));
+        let third = cell.begin_run();
+        assert_eq!(cell.ended(second), None);
+        // two watchers of one run: kept until both read it
+        assert_eq!((cell.watch(), cell.watch()), (third, third));
+        cell.record(third, Err("the engine went away".into()));
+        cell.unwatch(third);
+        assert!(cell.ended(third).is_some());
+        cell.unwatch(third);
+        assert!(cell.ended(third).is_none());
+        // watchers that never read (their isolate went): bounded
+        for _ in 0..OUTCOMES_MAX * 2 {
+            let run = cell.begin_run();
+            cell.watch();
+            cell.record(run, exit(1));
+        }
+        cell.begin_run();
+        assert!(cell.outcomes.lock().unwrap().len() <= OUTCOMES_MAX);
+    }
 
     #[test]
     fn names_carry_their_node() {
