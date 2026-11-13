@@ -65,14 +65,14 @@ export class Conformance extends DurableObject {
       await this.ctx.storage.delete("ended");
       c.start({ image: c.images.base, enableInternet: false });
       c.monitor().then(
-        () => this.ctx.storage.put("ended", "resolved"),
-        (error) => this.ctx.storage.put("ended", `exit ${error.exitCode}`),
+        () => this.ctx.storage.put("ended", { how: "resolved", at: Date.now() }),
+        (error) => this.ctx.storage.put("ended", { how: `exit ${error.exitCode}`, at: Date.now() }),
       );
       return new Response("started");
     }
     if (step === "/monitor/kill") {
       c.signal(9);
-      return new Response("killed");
+      return Response.json({ at: Date.now() });
     }
     // A watch left by an answered event, its run ended while another event
     // waited, and that event starting the next run before any other event
@@ -116,6 +116,17 @@ export class Conformance extends DurableObject {
         await ended;
       }
       return new Response("stopped");
+    }
+    // A watch left by an answered event, awaited by every request the
+    // object admits, its container ending on its own: the end reaches them
+    // (`exit_wake_under_saturation`).
+    if (step === "/saturate/start") {
+      c.start({ image: c.images.base, enableInternet: false, entrypoint: ["sh", "-c", "sleep 6; exit 3"] });
+      this.watching = c.monitor().then(() => "resolved", (error) => `exit ${error.exitCode}`);
+      return new Response("started");
+    }
+    if (step === "/saturate/wait") {
+      return new Response(this.watching ? await this.watching : "no watch");
     }
     if (step === "/monitor/ended") {
       return Response.json({ ended: (await this.ctx.storage.get("ended")) ?? null, running: c.running });
@@ -426,7 +437,9 @@ export default {
     const answer = await env.CONFORMANCE.get(env.CONFORMANCE.idFromName(name)).fetch(request);
     const verdict = await answer.json();
     // Each step its own event on a fresh object: the monitor() was set by an
-    // event that answered before the container was killed.
+    // event that answered before the container was killed, and it settles
+    // as the container stops, not at the object's next event (read once,
+    // 3 s after the kill).
     const t0 = Date.now();
     const box = env.CONFORMANCE.get(env.CONFORMANCE.idFromName(`${name}-monitor`));
     const step = (path) => box.fetch(`http://conformance${path}`);
@@ -434,14 +447,13 @@ export default {
     try {
       await step("/monitor/start");
       await sleep(5000);
-      await step("/monitor/kill");
-      const ended = await within(30000, "the exit settles monitor()", async () => {
-        const seen = await (await step("/monitor/ended")).json();
-        return seen.ended === null ? undefined : seen;
-      });
-      result = ended.ended === "exit 137"
-        ? { ok: true, ms: Date.now() - t0, detail: ended }
-        : { ok: false, ms: Date.now() - t0, error: `expected: ${JSON.stringify(ended)}` };
+      const killed = await (await step("/monitor/kill")).json();
+      await sleep(3000);
+      const seen = await (await step("/monitor/ended")).json();
+      const settled = seen.ended && seen.ended.at - killed.at;
+      result = seen.ended?.how === "exit 137" && settled < 2000
+        ? { ok: true, ms: Date.now() - t0, detail: { ...seen, settledMs: settled } }
+        : { ok: false, ms: Date.now() - t0, error: `expected: ${JSON.stringify({ ...seen, settledMs: settled })}` };
     } catch (error) {
       result = { ok: false, ms: Date.now() - t0, error: error?.message ?? String(error) };
     }
@@ -471,6 +483,51 @@ export default {
     }
     verdict.results.monitor_across_a_restart = restart;
     verdict.summary[restart.ok ? "passed" : "failed"] += 1;
+    // Past the object's request limit (64 on `celld dev`; none on
+    // Cloudflare), on a fresh object: each admitted wait hears the exit, and
+    // a refused one is answered at once (503).
+    const t2 = Date.now();
+    const full = env.CONFORMANCE.get(env.CONFORMANCE.idFromName(`${name}-saturate`));
+    let saturate;
+    try {
+      await full.fetch("http://conformance/saturate/start");
+      // waves at 0, 2, 4 and 5.5 s, so a slot an earlier answer freed is
+      // held again when the container ends, 6 s on
+      const wave = () => Array.from({ length: 80 }, () =>
+        full.fetch("http://conformance/saturate/wait").then(async (r) => (r.status === 200 ? await r.text() : `status ${r.status}`)));
+      const waits = [...wave()];
+      await sleep(2000);
+      waits.push(...wave());
+      await sleep(2000);
+      waits.push(...wave());
+      await sleep(1500);
+      // the precondition: refused as the container ends, the object's
+      // admission full (an admitted wait answers only after the end)
+      const last = await Promise.race([
+        Promise.all(wave().map((w) => Promise.race([w, sleep(300).then(() => "waiting")]))),
+        sleep(1000).then(() => []),
+      ]);
+      const refusedLast = last.filter((s) => s === "status 503").length;
+      const said = await Promise.race([
+        Promise.all(waits),
+        sleep(30000).then(() => null),
+      ]);
+      const counts = {};
+      for (const s of said ?? []) counts[s] = (counts[s] ?? 0) + 1;
+      const heard = said !== null && said.every((s) => s === "exit 3" || s === "status 503") && (counts["exit 3"] ?? 0) > 0;
+      // on a runtime with no request limit (Cloudflare) none is refused,
+      // and the check is of the wait alone
+      const admissionFull = refusedLast > 0 || (counts["status 503"] ?? 0) === 0;
+      saturate = !admissionFull
+        ? { ok: false, ms: Date.now() - t2, error: `admission was not full as the container ended: ${JSON.stringify({ refusedLast, counts })}` }
+        : heard
+          ? { ok: true, ms: Date.now() - t2, detail: { ...counts, refusedLast } }
+          : { ok: false, ms: Date.now() - t2, error: said === null ? "waits still pending after 30 s" : `expected: ${JSON.stringify(counts)}` };
+    } catch (error) {
+      saturate = { ok: false, ms: Date.now() - t2, error: error?.message ?? String(error) };
+    }
+    verdict.results.exit_wake_under_saturation = saturate;
+    verdict.summary[saturate.ok ? "passed" : "failed"] += 1;
     return Response.json(verdict);
   },
 };

@@ -1630,6 +1630,47 @@ impl RuntimeManager {
         result
     }
 
+    /// fork: a lifecycle notification to a published cell (a container's
+    /// run ended: container.rs `wake_cell`), past the cell's request
+    /// admission: the handlers in flight may be the ones waiting for it, so
+    /// it must never be refused as one more request. `None` when the cell is
+    /// not published on this node (its isolate and its waiters went).
+    pub async fn notify_cell(&self, cell: String, request: RuntimeFetch) -> anyhow::Result<Option<HttpResponse>> {
+        let affiliation = {
+            let cells = self.cells.lock().expect("cell registry poisoned");
+            let Some(handle) = cells.published.get(&cell) else {
+                return Ok(None);
+            };
+            handle.residency.slot().affiliate()
+        };
+        let RuntimeFetch {
+            url,
+            method,
+            body,
+            headers,
+            request_id: _,
+            order,
+            parent,
+        } = request;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::Fetch {
+            request_id: None,
+            scope: cell,
+            name: None,
+            url,
+            method,
+            body,
+            headers,
+            reply,
+            order,
+        };
+        let alarm_reporter = self.alarm_reporter.clone();
+        tokio::spawn(async move {
+            drive_cell_with_request_cancellation(affiliation, job, Some(alarm_reporter), parent, None).await;
+        });
+        receive_cell_fetch_reply(receive, None, None).await.map(Some)
+    }
+
     /// Tell a cell to abandon a fetch, by name.
     ///
     /// `fetch_cell` drops its reply receiver and returns when its explicit

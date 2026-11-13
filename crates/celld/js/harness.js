@@ -2611,6 +2611,8 @@ const __interceptRoute = (binding, method) => {
   const entrypoint = meta.entrypoint === "default" ? null : (meta.entrypoint ?? null);
   return { script: meta.script, entrypoint, props };
 };
+// fork: container.rs `CONTAINER_EXITED_URL`.
+const __CONTAINER_EXITED_URL = "http://container.celld.internal/exited";
 class Container {
   constructor(scope) {
     this._scope = scope;
@@ -5670,6 +5672,10 @@ const __dispatchTo = __celld.__dispatchTo = async (
   try {
     const dispatch = (async () => {
       const inst = await _readyInstance(scope);
+      // fork: the host's wake after a container's run ended
+      // (container.rs `wake_cell`): `_readyInstance` settled its monitor()
+      // watchers, and the object's own fetch() never sees it
+      if (url === __CONTAINER_EXITED_URL) return new Response(null, { status: 204 });
       return await __ctxRun(undefined, () => inst.fetch(
         __makeRequest(
           url,
