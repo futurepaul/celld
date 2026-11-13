@@ -2703,11 +2703,13 @@ class Container {
   async monitor() {
     if (!this.running)
       throw new Error("monitor() cannot be called on a container that is not running.");
-    const run = __container_run(this._scope);
+    // fork: this run, exactly: its outcome is kept for this watch until it
+    // reads it (_settle)
+    const run = __container_watch(this._scope);
     return new Promise((resolve, reject) => {
       const watch = { run, resolve, reject };
       this._watching.push(watch);
-      __container_monitor(this._scope).then(
+      __container_monitor(this._scope, run).then(
         (raw) => this._settle(watch, JSON.parse(raw)),
         (error) => this._settle(watch, { thrown: error }),
       );
@@ -2718,6 +2720,7 @@ class Container {
     const at = this._watching.indexOf(watch);
     if (at < 0) return;
     this._watching.splice(at, 1);
+    __container_unwatch(this._scope, watch.run);
     const reason = this._destroyReason;
     this._destroyReason = undefined;
     if (ended.thrown !== undefined) return watch.reject(ended.thrown);

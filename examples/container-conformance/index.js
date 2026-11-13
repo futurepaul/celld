@@ -74,6 +74,50 @@ export class Conformance extends DurableObject {
       c.signal(9);
       return Response.json({ at: Date.now() });
     }
+    // A watch left by an answered event, its run ended while another event
+    // waited, and that event starting the next run before any other event
+    // could settle the watch: the watch still hears its own run's end
+    // (`monitor_across_a_restart`).
+    if (step === "/restart/start") {
+      await this.ctx.storage.delete("restart");
+      c.start({ image: c.images.base, enableInternet: false });
+      c.monitor().then(
+        () => this.ctx.storage.put("restart", "resolved"),
+        (error) => this.ctx.storage.put("restart", `exit ${error.exitCode}`),
+      );
+      return new Response("started");
+    }
+    if (step === "/restart/race") {
+      c.signal(9);
+      await sleep(20); // the signal goes out
+      // Held in this turn while the container stops, so no other event (an
+      // exit's wake included) runs between its end and the next start; a
+      // runtime whose `running` moves only between turns ends the loop by
+      // its count and waits as any event would.
+      let reads = 0;
+      const d0 = Date.now();
+      for (; c.running && reads < 1e8; reads++);
+      const inTurn = !c.running;
+      // and a while longer in the turn, as an event doing other work would,
+      // so the end is recorded before the next start opens its run
+      for (let i = 0; i < 3e5; i++) c.running;
+      const spun = Date.now() - d0;
+      const t0 = Date.now();
+      while (c.running && Date.now() - t0 < 10000) await sleep(1);
+      c.start({ image: c.images.base, enableInternet: false });
+      return Response.json({ reads, inTurn, spun });
+    }
+    if (step === "/restart/ended") {
+      return Response.json({ ended: (await this.ctx.storage.get("restart")) ?? null });
+    }
+    if (step === "/restart/stop") {
+      if (c.running) {
+        const ended = c.monitor().catch(() => {});
+        await c.destroy();
+        await ended;
+      }
+      return new Response("stopped");
+    }
     if (step === "/monitor/ended") {
       return Response.json({ ended: (await this.ctx.storage.get("ended")) ?? null, running: c.running });
     }
@@ -143,6 +187,21 @@ export class Conformance extends DurableObject {
       return expect((await p.exitCode) === 0, "exit 0");
     });
     await stop();
+    // An intercept set right after start(), then an exec at once, with no
+    // wait for the container's server: the exec's request finds its host
+    // intercepted, every time (three starts).
+    await check("intercept_then_exec_while_starting", async () => {
+      const said = [];
+      for (let i = 0; i < 3; i++) {
+        c.start({ image, enableInternet: false });
+        await c.interceptOutboundHttp(`race${i}.example`, this.ctx.exports.Interceptor);
+        const p = await c.exec(["wget", "-qO-", "-T", "5", `http://race${i}.example/x`]);
+        const o = await p.output();
+        said.push({ code: o.exitCode, out: new TextDecoder().decode(o.stdout), err: new TextDecoder().decode(o.stderr) });
+        await stop();
+      }
+      return expect(said.every((r, i) => r.code === 0 && r.out === `intercepted GET http://race${i}.example/x`), said);
+    });
     await check("start", async () => {
       c.start({
         image,
@@ -334,6 +393,21 @@ export class Conformance extends DurableObject {
       return expect((await ended) === "boom", await ended);
     });
     await stop();
+    // An intercept set while a start is under way answers for the rule the
+    // engine took, or fails: one it refuses (a host with an underscore) is
+    // the call's error, never a success the guest finds nothing behind.
+    // Last, since a runtime may keep the refused rule for the object's life.
+    await check("interceptOutboundHttp_refused_while_starting", async () => {
+      c.start({ image, enableInternet: false });
+      let refused = null;
+      try {
+        await c.interceptOutboundHttp("not_a_host.example", this.ctx.exports.Interceptor);
+      } catch (error) {
+        refused = error?.message ?? String(error);
+      }
+      await stop();
+      return expect(refused !== null, { refused });
+    });
 
     const verdicts = Object.values(results);
     const summary = {
@@ -375,6 +449,27 @@ export default {
     }
     verdict.results.monitor_after_its_event = result;
     verdict.summary[result.ok ? "passed" : "failed"] += 1;
+    // A restart with an event pending (`/restart/*` above), on a fresh object.
+    const t1 = Date.now();
+    const again = env.CONFORMANCE.get(env.CONFORMANCE.idFromName(`${name}-restart`));
+    const at = (path) => again.fetch(`http://conformance${path}`);
+    let restart;
+    try {
+      await at("/restart/start");
+      await sleep(5000);
+      const raced = await (await at("/restart/race")).json();
+      await sleep(3000);
+      const seen = { ...(await (await at("/restart/ended")).json()), raced };
+      restart = seen.ended === "exit 137"
+        ? { ok: true, ms: Date.now() - t1, detail: seen }
+        : { ok: false, ms: Date.now() - t1, error: `expected: ${JSON.stringify(seen)}` };
+    } catch (error) {
+      restart = { ok: false, ms: Date.now() - t1, error: error?.message ?? String(error) };
+    } finally {
+      await at("/restart/stop").catch(() => {});
+    }
+    verdict.results.monitor_across_a_restart = restart;
+    verdict.summary[restart.ok ? "passed" : "failed"] += 1;
     return Response.json(verdict);
   },
 };
