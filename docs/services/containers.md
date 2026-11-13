@@ -112,6 +112,9 @@ under way answers once the engine holds it: the start installs it before the
 container counts as up, in its launch or after it, and an installation that
 fails (a launch the engine refuses included) is the call's error. A host intercepted
 again takes the new binding in its place, counting once toward the 128 entries.
+An `exec()` while a `start()` is under way waits for the container to be up, as
+on Cloudflare, where the engine would refuse it; up includes the intercepts set
+during the start, installed.
 A WebSocket upgrade to an intercepted host reaches the binding, which answers it
 as it answers a client's. A body of 1 MiB or more, or of no declared length,
 streams to the binding, at most `CELLD_MAX_REQUEST_BODY_BYTES`. `getTcpPort()` reaches a port through a loopback listener per port,
