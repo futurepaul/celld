@@ -846,7 +846,7 @@ fn is_dockerfile(root: &Path, image: &str) -> bool {
     std::fs::symlink_metadata(root.join(image)).is_ok_and(|metadata| metadata.is_file())
 }
 
-fn engine_cli() -> String {
+pub(crate) fn engine_cli() -> String {
     std::env::var("CELLD_DOCKER").unwrap_or_else(|_| "docker".to_string())
 }
 

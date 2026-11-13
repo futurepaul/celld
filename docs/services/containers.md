@@ -65,7 +65,10 @@ image rides with every deployment that has a container.
 
 `celld deploy` builds and pulls for `linux/amd64`, as Wrangler does.
 `CELLD_CONTAINER_PLATFORM` selects another platform. `celld dev` builds for the
-local machine and keeps the image in the local engine.
+local machine and keeps the image in the local engine. A krun engine never reads
+Docker's store, so on one `celld dev` loads each image it built into the engine
+when the engine lacks it, under the content reference a node starts it by, the
+`docker save` piped to the engine as it is written.
 
 The container runs on the node that owns the cell. Each node that serves a
 container class needs a Docker or Podman daemon. celld uses the Unix socket
