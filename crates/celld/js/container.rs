@@ -61,6 +61,19 @@ pub(super) fn op_container_watch(
     rv.set(v8::Number::new(scope, run as f64).into());
 }
 
+/// fork: the object's instance made its `ctx.container`: the watchers of
+/// any earlier instance went with that instance.
+pub(super) fn op_container_activate(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    if let Some(cell) = ready_cell(&cell) {
+        cell.activate();
+    }
+}
+
 /// fork: a `monitor()` of run `run` has read its outcome.
 pub(super) fn op_container_unwatch(
     scope: &mut v8::PinScope,

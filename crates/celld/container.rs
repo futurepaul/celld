@@ -278,17 +278,17 @@ impl InterceptRule {
     }
 }
 
-/// fork: one run's outcome, kept until the `monitor()`s watching it have
+/// fork: one run's outcome, kept while a live `monitor()` of it has yet to
 /// read it.
 #[derive(Default)]
 struct Outcome {
     exit: Option<Result<RunExit, String>>,
+    /// The `monitor()`s of the object's current instance that watch this
+    /// run and have not read it. Those of an earlier instance went with
+    /// it (`CellContainer::activate`): an outcome only they watch is
+    /// abandoned.
     watchers: u32,
 }
-
-/// fork: the run outcomes a cell keeps, at most; past it the oldest ended
-/// one goes, read or not.
-const OUTCOMES_MAX: usize = 64;
 
 /// Where an intercepted request goes: the binding's route, as
 /// `globalOutbound` keeps one, so it outlives the object's isolate.
@@ -509,19 +509,26 @@ impl CellContainer {
         self.exit.send_replace(Some((run, exit)));
     }
 
-    /// fork: the outcomes no watcher will read go (each read, or none
-    /// registered), and past `OUTCOMES_MAX` the oldest ended ones: a
-    /// watcher whose isolate went never reads its own.
+    /// fork: the object's instance is new (its `ctx.container` made): the
+    /// `monitor()`s of any earlier instance went with it, so the outcomes
+    /// only they watched are abandoned, and go.
+    pub fn activate(&self) {
+        let mut outcomes = self.outcomes.lock().unwrap();
+        for outcome in outcomes.values_mut() {
+            outcome.watchers = 0;
+        }
+        drop(outcomes);
+        self.prune_outcomes();
+    }
+
+    /// fork: the ended outcomes no live watcher will read go: each read, or
+    /// only abandoned watchers' (`activate`). One a live watcher waits for
+    /// is never dropped. Those are bounded by the instance's `monitor()`s
+    /// still unsettled: a run must end before the next starts, and the
+    /// object's next event (or its exit wake) settles each ended run's.
     fn prune_outcomes(&self) {
         let mut outcomes = self.outcomes.lock().unwrap();
         outcomes.retain(|_, outcome| outcome.exit.is_none() || outcome.watchers > 0);
-        // Bounded: each pass removes one entry, or stops.
-        while outcomes.len() > OUTCOMES_MAX {
-            let Some(oldest) = outcomes.iter().find(|(_, outcome)| outcome.exit.is_some()).map(|(run, _)| *run) else {
-                break;
-            };
-            outcomes.remove(&oldest);
-        }
     }
 
     /// `inspect()`: the running container's image and labels, or `None`.
@@ -1855,9 +1862,8 @@ mod tests {
 
     // Goal (review of the stack, finding 2): a monitor() of a run keeps that
     // run's outcome through a later start, and never takes the later run's;
-    // an outcome no watcher holds goes at the next start; one read goes; a
-    // watcher whose isolate went cannot hold more than OUTCOMES_MAX. Replay:
-    // read twice, the same outcome.
+    // an outcome no watcher holds goes at the next start; one read goes.
+    // Replay: read twice, the same outcome.
     #[test]
     fn a_run_keeps_its_own_outcome_for_its_watchers() {
         let cell = a_cell();
@@ -1883,14 +1889,56 @@ mod tests {
         assert!(cell.ended(third).is_some());
         cell.unwatch(third);
         assert!(cell.ended(third).is_none());
-        // watchers that never read (their isolate went): bounded
-        for _ in 0..OUTCOMES_MAX * 2 {
-            let run = cell.begin_run();
-            cell.watch();
-            cell.record(run, exit(1));
-        }
+    }
+
+    // Goal (review round 2, finding 2): an outcome a live watcher still
+    // waits for is never pruned, however many there are: 70 runs, each
+    // watched and ended, all still readable after the next start.
+    #[test]
+    fn live_watched_outcomes_survive_past_64() {
+        let cell = a_cell();
+        let runs: Vec<u64> = (0..70)
+            .map(|_| {
+                let run = cell.begin_run();
+                assert_eq!(cell.watch(), run);
+                cell.record(run, exit(3));
+                run
+            })
+            .collect();
         cell.begin_run();
-        assert!(cell.outcomes.lock().unwrap().len() <= OUTCOMES_MAX);
+        for run in runs {
+            assert_eq!(cell.ended(run), Some(exit(3)), "run {run}'s live watcher still reads it");
+        }
+    }
+
+    // Goal (review round 2, finding 2): the outcomes only an earlier
+    // instance's watchers waited for (gone with it) go once a new instance
+    // makes its container; a run still running stays, and the new
+    // instance's watchers keep theirs.
+    #[test]
+    fn abandoned_outcomes_go_when_a_new_instance_comes() {
+        let cell = a_cell();
+        let abandoned: Vec<u64> = (0..70)
+            .map(|_| {
+                let run = cell.begin_run();
+                cell.watch();
+                cell.record(run, exit(3));
+                run
+            })
+            .collect();
+        let running = cell.begin_run();
+        cell.watch();
+        cell.activate();
+        for run in &abandoned {
+            assert_eq!(cell.ended(*run), None, "run {run}: its watcher's instance went");
+        }
+        assert!(cell.outcomes.lock().unwrap().contains_key(&running), "a run still running stays");
+        // the new instance watches it: its end is kept for it
+        assert_eq!(cell.watch(), running);
+        cell.record(running, exit(0));
+        cell.begin_run();
+        assert_eq!(cell.ended(running), Some(exit(0)));
+        assert_eq!(cell.outcomes.lock().unwrap().len(), 1, "that run's alone: the new one is unwatched");
     }
 
     #[test]
