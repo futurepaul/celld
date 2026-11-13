@@ -109,7 +109,8 @@ Cloudflare. The socket is beside the node's data when that path fits a Unix
 socket's 107 bytes, and otherwise in `$XDG_RUNTIME_DIR/celld`, named by a hash
 of the node's data directory. An intercept the object sets while a `start()` is
 under way answers once the engine holds it: the start installs it before the
-container counts as up, and an installation that fails is the call's error. A host intercepted
+container counts as up, in its launch or after it, and an installation that
+fails (a launch the engine refuses included) is the call's error. A host intercepted
 again takes the new binding in its place, counting once toward the 128 entries.
 `getTcpPort()` reaches a port through a loopback listener per port,
 whose connections take a socket from the engine, TCP over the VM's network
