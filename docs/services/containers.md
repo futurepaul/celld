@@ -108,7 +108,8 @@ uses the CA at `/etc/cloudflare/certs/cloudflare-containers-ca.crt`, as on
 Cloudflare. The socket is beside the node's data when that path fits a Unix
 socket's 107 bytes, and otherwise in `$XDG_RUNTIME_DIR/celld`, named by a hash
 of the node's data directory. An intercept the object sets while a `start()` is
-under way reaches the engine once the container runs, and a host intercepted
+under way answers once the engine holds it: the start installs it before the
+container counts as up, and an installation that fails is the call's error. A host intercepted
 again takes the new binding in its place, counting once toward the 128 entries.
 A WebSocket upgrade to an intercepted host reaches the binding, which answers it
 as it answers a client's. A body of 1 MiB or more, or of no declared length,
