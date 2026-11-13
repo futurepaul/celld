@@ -1632,6 +1632,7 @@ mod tests {
     struct Fake {
         image: Gate,
         launch: Gate,
+        install: Gate,
         refused: Mutex<Option<String>>,
         install_ms: AtomicU64,
         launched: Mutex<Vec<InterceptRule>>,
@@ -1711,6 +1712,7 @@ mod tests {
             Ok(Value::Null)
         }
         async fn set_intercepts(&self, _: &str, intercepts: &[InterceptRule]) -> anyhow::Result<()> {
+            self.install.pass().await;
             asyncrt::sleep(Duration::from_millis(self.install_ms.load(Ordering::SeqCst))).await;
             if let Some(refused) = self.refuses(intercepts) {
                 return Err(anyhow!("intercepts failed with [400] {refused}"));
@@ -1833,6 +1835,60 @@ mod tests {
         assert_eq!(fake.launched.lock().unwrap().clone(), vec![http("first.example")], "the rule was not in the launch");
         let error = format!("{:#}", registered.expect_err("the install's refusal answers the registration"));
         assert!(error.contains("refused.example"), "{error}");
+    }
+
+    // Goal (review round 2, item 4: intercept_then_exec_while_starting made
+    // deterministic): an exec asked while a start installs the intercepts
+    // set during it (its container already started) runs only once they
+    // are installed. Forced: the start is held in its launch (its list
+    // read) until the rule is recorded, then held in that install while the
+    // exec is asked; the fake engine records what the exec found installed.
+    #[test]
+    fn an_exec_during_a_start_waits_for_its_intercepts() {
+        rt().block_on(an_exec_during_a_start());
+    }
+
+    async fn an_exec_during_a_start() {
+        let fake = Arc::new(Fake::default());
+        fake.launch.hold();
+        fake.install.hold();
+        let engine = an_engine(&fake).await;
+        let cell = a_box();
+        let run = cell.begin_run();
+        let starting = {
+            let (engine, cell) = (engine.clone(), cell.clone());
+            asyncrt::spawn(async move { engine.start(&cell, run, start_img()).await })
+        };
+        fake.launch.reached().await;
+        let registering = {
+            let (engine, cell) = (engine.clone(), cell.clone());
+            asyncrt::spawn(async move { engine.intercept(&cell, http("race.example"), a_route()).await })
+        };
+        recorded(&cell, 1).await;
+        fake.launch.open();
+        fake.install.reached().await;
+        assert!(cell.state.lock().unwrap().info.started, "the container started; its intercepts are being installed");
+        let execing = {
+            let (engine, cell) = (engine.clone(), cell.clone());
+            let params = ExecParams {
+                cmd: vec!["wget".into(), "http://race.example/x".into()],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                stdin: false,
+                stdout: OutputMode::Pipe,
+                stderr: OutputMode::Pipe,
+                pty: None,
+            };
+            asyncrt::spawn(async move { engine.exec(&cell, params).await.map(|_| ()) })
+        };
+        asyncrt::sleep(Duration::from_millis(20)).await;
+        assert!(fake.seen_by_exec.lock().unwrap().is_empty(), "the exec waits while the install is held");
+        fake.install.open();
+        starting.await.unwrap().unwrap();
+        execing.await.unwrap().unwrap();
+        registering.await.unwrap().unwrap();
+        assert_eq!(fake.seen_by_exec.lock().unwrap().clone(), vec![vec!["race.example".to_string()]], "the exec ran with the rule installed");
     }
 
     async fn a_rule_refused_in_its_launch() {
