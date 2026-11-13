@@ -56,8 +56,70 @@ async function text(stream) {
 }
 
 export class Conformance extends DurableObject {
-  async fetch() {
+  async fetch(request) {
     const c = this.ctx.container;
+    // A monitor() set by an event that then answers: the container's exit
+    // settles it later all the same (`monitor_after_its_event`).
+    const step = new URL(request.url).pathname;
+    if (step === "/monitor/start") {
+      await this.ctx.storage.delete("ended");
+      c.start({ image: c.images.base, enableInternet: false });
+      c.monitor().then(
+        () => this.ctx.storage.put("ended", "resolved"),
+        (error) => this.ctx.storage.put("ended", `exit ${error.exitCode}`),
+      );
+      return new Response("started");
+    }
+    if (step === "/monitor/kill") {
+      c.signal(9);
+      return new Response("killed");
+    }
+    // A watch left by an answered event, its run ended while another event
+    // waited, and that event starting the next run before any other event
+    // could settle the watch: the watch still hears its own run's end
+    // (`monitor_across_a_restart`).
+    if (step === "/restart/start") {
+      await this.ctx.storage.delete("restart");
+      // it ends on its own, 8 s on: no event's kill needs to go out
+      c.start({ image: c.images.base, enableInternet: false, entrypoint: ["sh", "-c", "sleep 8; exit 3"] });
+      c.monitor().then(
+        () => this.ctx.storage.put("restart", "resolved"),
+        (error) => this.ctx.storage.put("restart", `exit ${error.exitCode}`),
+      );
+      return new Response("started");
+    }
+    if (step === "/restart/race") {
+      // Held in this turn while the container stops, so no other event (an
+      // exit's wake included) runs between its end and the next start; a
+      // runtime whose `running` moves only between turns ends the loop by
+      // its count and waits as any event would.
+      let reads = 0;
+      const d0 = Date.now();
+      for (; c.running && reads < 1e8; reads++);
+      const inTurn = !c.running;
+      // and a while longer in the turn, as an event doing other work would,
+      // so the end is recorded before the next start opens its run
+      for (let i = 0; i < 3e5; i++) c.running;
+      const spun = Date.now() - d0;
+      const t0 = Date.now();
+      while (c.running && Date.now() - t0 < 10000) await sleep(1);
+      c.start({ image: c.images.base, enableInternet: false });
+      return Response.json({ reads, inTurn, spun });
+    }
+    if (step === "/restart/ended") {
+      return Response.json({ ended: (await this.ctx.storage.get("restart")) ?? null });
+    }
+    if (step === "/restart/stop") {
+      if (c.running) {
+        const ended = c.monitor().catch(() => {});
+        await c.destroy();
+        await ended;
+      }
+      return new Response("stopped");
+    }
+    if (step === "/monitor/ended") {
+      return Response.json({ ended: (await this.ctx.storage.get("ended")) ?? null, running: c.running });
+    }
     const results = {};
     // Each check has a budget, so one that hangs is a failure, not a hung
     // suite.
@@ -338,6 +400,54 @@ export default {
     const url = new URL(request.url);
     if (url.pathname !== "/run") return new Response("GET /run", { status: 404 });
     const name = url.searchParams.get("id") ?? `run-${Date.now()}`;
-    return env.CONFORMANCE.get(env.CONFORMANCE.idFromName(name)).fetch(request);
+    const answer = await env.CONFORMANCE.get(env.CONFORMANCE.idFromName(name)).fetch(request);
+    const verdict = await answer.json();
+    // Each step its own event on a fresh object: the monitor() was set by an
+    // event that answered before the container was killed.
+    const t0 = Date.now();
+    const box = env.CONFORMANCE.get(env.CONFORMANCE.idFromName(`${name}-monitor`));
+    const step = (path) => box.fetch(`http://conformance${path}`);
+    let result;
+    try {
+      await step("/monitor/start");
+      await sleep(5000);
+      await step("/monitor/kill");
+      const ended = await within(30000, "the exit settles monitor()", async () => {
+        const seen = await (await step("/monitor/ended")).json();
+        return seen.ended === null ? undefined : seen;
+      });
+      result = ended.ended === "exit 137"
+        ? { ok: true, ms: Date.now() - t0, detail: ended }
+        : { ok: false, ms: Date.now() - t0, error: `expected: ${JSON.stringify(ended)}` };
+    } catch (error) {
+      result = { ok: false, ms: Date.now() - t0, error: error?.message ?? String(error) };
+    }
+    verdict.results.monitor_after_its_event = result;
+    verdict.summary[result.ok ? "passed" : "failed"] += 1;
+    // A restart with an event pending (`/restart/*` above), on a fresh object.
+    const t1 = Date.now();
+    const again = env.CONFORMANCE.get(env.CONFORMANCE.idFromName(`${name}-restart`));
+    const at = (path) => again.fetch(`http://conformance${path}`);
+    let restart;
+    try {
+      await at("/restart/start");
+      await sleep(6000);
+      const raced = await (await at("/restart/race")).json();
+      await sleep(3000);
+      const seen = { ...(await (await at("/restart/ended")).json()), raced };
+      // the race reached: the next start made in the turn that saw the end
+      restart = !raced.inTurn
+        ? { ok: false, ms: Date.now() - t1, error: `the race was not taken in one turn: ${JSON.stringify(raced)}` }
+        : seen.ended === "exit 3"
+          ? { ok: true, ms: Date.now() - t1, detail: seen }
+          : { ok: false, ms: Date.now() - t1, error: `expected: ${JSON.stringify(seen)}` };
+    } catch (error) {
+      restart = { ok: false, ms: Date.now() - t1, error: error?.message ?? String(error) };
+    } finally {
+      await at("/restart/stop").catch(() => {});
+    }
+    verdict.results.monitor_across_a_restart = restart;
+    verdict.summary[restart.ok ? "passed" : "failed"] += 1;
+    return Response.json(verdict);
   },
 };

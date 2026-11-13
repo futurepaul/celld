@@ -203,7 +203,11 @@ count against `max_instances`. A start over the cap fails, and the node logs
 - `getTcpPort(port).connect()` gives a socket with the lifetime of the event
   that opened it. See [TCP sockets](../cloudflare-compat.md#tcp-sockets).
 - A `monitor()` promise and an `exec()` process do not keep the object active
-  after the handler answers.
+  after the handler answers. A `monitor()` whose event has answered settles at
+  the object's next event (a request, an alarm, a WebSocket message), not as
+  the container stops, as on Cloudflare. Each `monitor()` hears its own run's
+  end, kept for it through a later `start()` while the object's instance that
+  called it lives.
 - On macOS, the node reaches a container through a published port, so the image
   must declare the port with `EXPOSE`. `enableInternet: false` has no effect on
   macOS.
