@@ -121,6 +121,18 @@ streams to the binding, at most `CELLD_MAX_REQUEST_BODY_BYTES`. `getTcpPort()` r
 whose connections take a socket from the engine, TCP over the VM's network
 interface or a relay to the guest's loopback.
 
+The node shows a krun container's output as Cloudflare shows a container's
+logs. The engine keeps the last 64 KiB of each stream, so the node reads it once
+a second while the container runs, and once more as it ends, and logs each new
+line as `container_output` with the cell, the run, and the stream. More output
+than the engine keeps between two reads is logged as `container_output_missed`.
+Each intercepted request is logged as `container_intercept`, with an id, the
+cell, the run, the intercept's index, and the binding. Its end is logged as
+`container_intercept_answered` with the status, or as
+`container_intercept_dropped` when the container's request goes away before the
+binding answers. On the Docker engine, a container's output stays in Docker's
+own logs.
+
 The Docker engine has no snapshots and no interception, and those calls reject
 with an error naming the engine. Its `exec()` inherits the container's whole
 environment, and its `kill()` signals a process by a pid that the daemon reports

@@ -590,7 +590,21 @@ pub(crate) trait Backend: Send + Sync {
     /// fork: lets go of what the backend holds outside the engine (the krun
     /// backend's intercept socket), at the node's stop.
     fn close(&self) {}
+
+    /// fork: shows run `run`'s output as the container writes it, each line
+    /// an event (`container_output`), as Cloudflare shows a container's
+    /// logs. The answer, awaited once the run has ended and before its end
+    /// is told, shows the last of it. `from_now` skips what the container
+    /// wrote before (a container adopted from an earlier owner). `None`
+    /// for an engine whose containers' output stays in its own logs
+    /// (Docker's, `docker logs`).
+    fn follow_output(&self, _name: &str, _cell: &str, _run: u64, _from_now: bool) -> Option<OutputEnd> {
+        None
+    }
 }
+
+/// fork: the end of a run's output (`Backend::follow_output`).
+pub(crate) type OutputEnd = futures_util::future::BoxFuture<'static, ()>;
 
 pub struct ContainerEngine {
     backend: Arc<dyn Backend>,
@@ -1040,7 +1054,7 @@ impl ContainerEngine {
                 state.installed = state.intercepts.len();
             }
             cell.up.send_replace(run);
-            self.watch_exit(&cell, run);
+            self.watch_exit(&cell, run, true);
         }
         let mut state = cell.state.lock().unwrap();
         state.running = running.is_some();
@@ -1065,10 +1079,15 @@ impl ContainerEngine {
     }
 
     /// The route of the intercept a container's engine named by index.
-    pub(crate) fn intercept_route(&self, name: &str, index: usize) -> Option<ServiceRoute> {
+    /// fork: with the container's cell and its current run, which the node
+    /// logs each intercepted request under.
+    pub(crate) fn intercept_route(&self, name: &str, index: usize) -> Option<(ServiceRoute, String, u64)> {
         let cell = self.cell_named(name)?;
         let state = cell.state.lock().unwrap();
-        state.intercepts.get(index).map(|i| i.route.clone())
+        state
+            .intercepts
+            .get(index)
+            .map(|i| (i.route.clone(), cell.scope.clone(), state.run))
     }
 
     /// The memory the node's running containers reserve, summed over their
@@ -1214,20 +1233,28 @@ impl ContainerEngine {
             );
             return Ok(());
         }
-        self.watch_exit(cell, run);
+        self.watch_exit(cell, run, false);
         Ok(())
     }
 
     /// Wait for the container's root process to end and publish the exit
     /// for `run`; a later run's start has already replaced the state.
-    fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64) {
+    /// fork: the run's output is shown meanwhile (`follow_output`), its last
+    /// before the exit is told: the object that hears it may restart the
+    /// container, and its output goes with it. `adopted`: a container an
+    /// earlier owner started, whose output so far was that owner's to show.
+    fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64, adopted: bool) {
         let backend = self.backend.clone();
         let cell_ = cell.clone();
+        let output = backend.follow_output(&cell.name, &cell.scope, run, adopted);
         asyncrt::spawn(async move {
             let result = backend
                 .wait(&cell_.name)
                 .await
                 .map_err(|error| format!("{error:#}"));
+            if let Some(end) = output {
+                end.await;
+            }
             let destroyed = {
                 let mut state = cell_.state.lock().unwrap();
                 let destroyed = state.destroyed == Some(run);
