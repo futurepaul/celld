@@ -296,6 +296,21 @@ export class Conformance extends DurableObject {
       return expect((await ended) === "boom", await ended);
     });
     await stop();
+    // An intercept set while a start is under way answers for the rule the
+    // engine took, or fails: one it refuses (a host with an underscore) is
+    // the call's error, never a success the guest finds nothing behind.
+    // Last, since a runtime may keep the refused rule for the object's life.
+    await check("interceptOutboundHttp_refused_while_starting", async () => {
+      c.start({ image, enableInternet: false });
+      let refused = null;
+      try {
+        await c.interceptOutboundHttp("not_a_host.example", this.ctx.exports.Interceptor);
+      } catch (error) {
+        refused = error?.message ?? String(error);
+      }
+      await stop();
+      return expect(refused !== null, { refused });
+    });
 
     const verdicts = Object.values(results);
     const summary = {
