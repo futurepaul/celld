@@ -278,17 +278,17 @@ impl InterceptRule {
     }
 }
 
-/// fork: one run's outcome, kept until the `monitor()`s watching it have
+/// fork: one run's outcome, kept while a live `monitor()` of it has yet to
 /// read it.
 #[derive(Default)]
 struct Outcome {
     exit: Option<Result<RunExit, String>>,
+    /// The `monitor()`s of the object's current instance that watch this
+    /// run and have not read it. Those of an earlier instance went with
+    /// it (`CellContainer::activate`): an outcome only they watch is
+    /// abandoned.
     watchers: u32,
 }
-
-/// fork: the run outcomes a cell keeps, at most; past it the oldest ended
-/// one goes, read or not.
-const OUTCOMES_MAX: usize = 64;
 
 /// Where an intercepted request goes: the binding's route, as
 /// `globalOutbound` keeps one, so it outlives the object's isolate.
@@ -337,6 +337,10 @@ struct CellState {
     /// fork: how many of `intercepts` (the first ones) the engine holds for
     /// this run: an `intercept()` answers once its own is among them.
     installed: usize,
+    /// fork: the run whose start failed, and why: an `intercept()` that
+    /// waited on that start answers with it (its rule in a launch the
+    /// engine refused, or never sent).
+    start_failed: Option<(u64, String)>,
 }
 
 /// Where the node reaches a container's ports.
@@ -457,6 +461,7 @@ impl CellContainer {
         state.address = Address::None;
         state.info = RunInfo::default();
         state.installed = 0;
+        state.start_failed = None;
         let run = state.run;
         drop(state);
         self.exit.send_replace(None);
@@ -504,19 +509,26 @@ impl CellContainer {
         self.exit.send_replace(Some((run, exit)));
     }
 
-    /// fork: the outcomes no watcher will read go (each read, or none
-    /// registered), and past `OUTCOMES_MAX` the oldest ended ones: a
-    /// watcher whose isolate went never reads its own.
+    /// fork: the object's instance is new (its `ctx.container` made): the
+    /// `monitor()`s of any earlier instance went with it, so the outcomes
+    /// only they watched are abandoned, and go.
+    pub fn activate(&self) {
+        let mut outcomes = self.outcomes.lock().unwrap();
+        for outcome in outcomes.values_mut() {
+            outcome.watchers = 0;
+        }
+        drop(outcomes);
+        self.prune_outcomes();
+    }
+
+    /// fork: the ended outcomes no live watcher will read go: each read, or
+    /// only abandoned watchers' (`activate`). One a live watcher waits for
+    /// is never dropped. Those are bounded by the instance's `monitor()`s
+    /// still unsettled: a run must end before the next starts, and the
+    /// object's next event (or its exit wake) settles each ended run's.
     fn prune_outcomes(&self) {
         let mut outcomes = self.outcomes.lock().unwrap();
         outcomes.retain(|_, outcome| outcome.exit.is_none() || outcome.watchers > 0);
-        // Bounded: each pass removes one entry, or stops.
-        while outcomes.len() > OUTCOMES_MAX {
-            let Some(oldest) = outcomes.iter().find(|(_, outcome)| outcome.exit.is_some()).map(|(run, _)| *run) else {
-                break;
-            };
-            outcomes.remove(&oldest);
-        }
     }
 
     /// `inspect()`: the running container's image and labels, or `None`.
@@ -1034,6 +1046,9 @@ impl ContainerEngine {
                 );
                 let mut state = cell.state.lock().unwrap();
                 state.running = false;
+                if state.run == run {
+                    state.start_failed = Some((run, format!("{error:#}")));
+                }
                 drop(state);
                 cell.record(run, Err(format!("{error:#}")));
                 cell.up.send_replace(run);
@@ -1267,9 +1282,9 @@ impl ContainerEngine {
             "interceptOutboundHttp() is not supported by celld's {} engine",
             self.backend.kind()
         );
-        let index = {
+        let (index, waited) = {
             let mut state = cell.state.lock().unwrap();
-            match state.intercepts.iter().position(|i| i.rule == rule) {
+            let index = match state.intercepts.iter().position(|i| i.rule == rule) {
                 Some(index) => {
                     state.intercepts[index].route = route;
                     index
@@ -1283,20 +1298,34 @@ impl ContainerEngine {
                     state.intercepts.push(Intercept { rule, route });
                     state.intercepts.len() - 1
                 }
-            }
+            };
+            // the start under way, if one is: this rule is its to install,
+            // in its launch or after it
+            let starting = state.running && *cell.up.borrow() < state.run;
+            (index, starting.then_some(state.run))
         };
         // fork: answered once the engine holds the rule, never before: a
-        // start under way is waited out (it installs what was set meanwhile
-        // before it counts as up), and a rule it did not install is sent
-        // here, its failure returned. A container that is not running holds
-        // none: its next start takes the rule with the rest. Bounded by the
-        // start, which ends either way (`up`).
+        // start under way is waited out (it installs what was set meanwhile,
+        // in its launch or after it, before it counts as up). A start that
+        // failed is the error of each registration that waited on it; a
+        // rule a start did not install is sent here, its failure returned.
+        // A container that is not running holds none, and no start was
+        // asked to install the rule: its next start takes it with the rest.
+        // Bounded by the start, which ends either way (`up`).
         let mut up = cell.up.subscribe();
         loop {
             let starting = {
                 let state = cell.state.lock().unwrap();
-                if !state.running || state.installed > index {
+                if state.installed > index {
                     return Ok(());
+                }
+                if !state.running {
+                    return match (waited, &state.start_failed) {
+                        (Some(run), Some((failed, error))) if *failed == run => {
+                            Err(anyhow!("the start this intercept waited on failed: {error}"))
+                        }
+                        _ => Ok(()),
+                    };
                 }
                 *up.borrow_and_update() < state.run
             };
@@ -1553,6 +1582,284 @@ pub(crate) fn node_prefix(node: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// A point the fake engine holds a step at, when told to, until the
+    /// test opens it: what forces an interleaving instead of racing for it.
+    struct Gate {
+        hold: AtomicBool,
+        entered: tokio::sync::Notify,
+        open: watch::Sender<bool>,
+    }
+
+    impl Default for Gate {
+        fn default() -> Gate {
+            Gate { hold: AtomicBool::new(false), entered: tokio::sync::Notify::new(), open: watch::channel(false).0 }
+        }
+    }
+
+    impl Gate {
+        fn hold(&self) {
+            self.hold.store(true, Ordering::SeqCst);
+        }
+
+        async fn pass(&self) {
+            if !self.hold.load(Ordering::SeqCst) {
+                return;
+            }
+            self.entered.notify_one();
+            let mut open = self.open.subscribe();
+            while !*open.borrow_and_update() {
+                open.changed().await.unwrap();
+            }
+        }
+
+        /// Until the held step is reached.
+        async fn reached(&self) {
+            self.entered.notified().await;
+        }
+
+        fn open(&self) {
+            self.open.send_replace(true);
+        }
+    }
+
+    /// The fake engine: a start's image preparation (`has_image`) and its
+    /// launch (`create_and_start`) can be held; a target can be refused,
+    /// at launch and at install alike; an install can be slow; and each
+    /// exec records the rules the engine held as it ran.
+    #[derive(Default)]
+    struct Fake {
+        image: Gate,
+        launch: Gate,
+        refused: Mutex<Option<String>>,
+        install_ms: AtomicU64,
+        launched: Mutex<Vec<InterceptRule>>,
+        installed: Mutex<Vec<InterceptRule>>,
+        seen_by_exec: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Fake {
+        fn refuses(&self, rules: &[InterceptRule]) -> Option<String> {
+            let refused = self.refused.lock().unwrap().clone()?;
+            rules.iter().any(|r| r.target == refused).then(|| format!("not a host: {refused}"))
+        }
+    }
+
+    struct NoIo;
+
+    #[async_trait::async_trait]
+    impl ExecIo for NoIo {
+        async fn write(&self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        async fn close_stdin(&self) {}
+        async fn wait(&self) -> anyhow::Result<i64> {
+            Ok(0)
+        }
+        async fn kill(&self, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn resize(&self, _: u16, _: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for Fake {
+        fn kind(&self) -> &'static str {
+            "fake"
+        }
+        async fn reap(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn prepare(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn has_image(&self, _: &str) -> anyhow::Result<bool> {
+            self.image.pass().await;
+            Ok(true)
+        }
+        async fn load_image(&self, _: &str, _: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn running(&self, _: &str) -> anyhow::Result<Option<Address>> {
+            Ok(None)
+        }
+        async fn create_and_start(&self, _: &str, launch: Launch) -> anyhow::Result<Address> {
+            *self.launched.lock().unwrap() = launch.intercepts.clone();
+            self.launch.pass().await;
+            if let Some(refused) = self.refuses(&launch.intercepts) {
+                return Err(anyhow!("start container failed with [400] {refused}"));
+            }
+            *self.installed.lock().unwrap() = launch.intercepts;
+            Ok(Address::None)
+        }
+        async fn wait(&self, _: &str) -> anyhow::Result<RunExit> {
+            std::future::pending().await
+        }
+        async fn signal(&self, _: &str, _: u32) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove(&self, _: &str) {}
+        async fn exec(&self, _: &str, _: &ExecParams) -> anyhow::Result<ExecStarted> {
+            let seen = self.installed.lock().unwrap().iter().map(|r| r.target.clone()).collect();
+            self.seen_by_exec.lock().unwrap().push(seen);
+            Ok(ExecStarted { pid: 1, io: Box::new(NoIo), stdout: mpsc::channel(1).1, stderr: mpsc::channel(1).1 })
+        }
+        async fn snapshot(&self, _: &str, _: Option<String>) -> anyhow::Result<Value> {
+            Ok(Value::Null)
+        }
+        async fn set_intercepts(&self, _: &str, intercepts: &[InterceptRule]) -> anyhow::Result<()> {
+            asyncrt::sleep(Duration::from_millis(self.install_ms.load(Ordering::SeqCst))).await;
+            if let Some(refused) = self.refuses(intercepts) {
+                return Err(anyhow!("intercepts failed with [400] {refused}"));
+            }
+            *self.installed.lock().unwrap() = intercepts.to_vec();
+            Ok(())
+        }
+        fn restores_snapshots(&self) -> bool {
+            false
+        }
+        fn intercepts(&self) -> bool {
+            true
+        }
+    }
+
+    /// The runtime the engine's tasks run on in these tests (asyncrt takes
+    /// one process handle, once).
+    fn rt() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            asyncrt::set_host_handle(runtime.handle().clone());
+            runtime
+        })
+    }
+
+    /// A cell of class `Box`, whose one image is `img`.
+    fn a_box() -> Arc<CellContainer> {
+        Arc::new(CellContainer {
+            scope: "Box:1".into(),
+            name: container_name("node-a", "Box:1"),
+            spec: Arc::new(serde_json::from_value(json!({ "class_name": "Box", "images": { "base": "img" } })).unwrap()),
+            state: Mutex::new(CellState::default()),
+            processes: Mutex::new(Vec::new()),
+            exit: watch::channel(None).0,
+            outcomes: Mutex::new(BTreeMap::new()),
+            up: watch::channel(0).0,
+            intercepts_sent: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    async fn an_engine(fake: &Arc<Fake>) -> Arc<ContainerEngine> {
+        Arc::new(ContainerEngine::connect(fake.clone(), "node-a".into(), None).await.unwrap())
+    }
+
+    fn start_img() -> StartParams {
+        StartParams {
+            image: Some("img".into()),
+            snapshot: None,
+            instance: None,
+            entrypoint: None,
+            env: Vec::new(),
+            enable_internet: false,
+            labels: Vec::new(),
+        }
+    }
+
+    fn http(target: &str) -> InterceptRule {
+        InterceptRule { scheme: "http", target: target.into() }
+    }
+
+    fn a_route() -> ServiceRoute {
+        ServiceRoute { generation: 1, script: "worker".into(), entrypoint: None, props: Vec::new() }
+    }
+
+    /// Until `cell` has recorded `n` intercepts, a few seconds at most.
+    async fn recorded(cell: &CellContainer, n: usize) {
+        for _ in 0..5000 {
+            if cell.state.lock().unwrap().intercepts.len() >= n {
+                return;
+            }
+            asyncrt::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("{n} intercepts were never recorded");
+    }
+
+    // Goal (review round 2, finding 1): a rule set while the start prepares
+    // its image goes out in the start's launch; when the engine refuses that
+    // launch, the registration waiting on the start answers with the start's
+    // error, never Ok. Forced: the start is held in its image preparation
+    // until the rule is recorded, so the rule can reach the engine only in
+    // the launch (checked: it was in the launch's list).
+    #[test]
+    fn a_rule_refused_in_its_launch_fails_its_registration() {
+        rt().block_on(a_rule_refused_in_its_launch());
+    }
+
+    // Goal: the other path. A rule set once the launch has read its list
+    // goes out in the start's install after it; the engine refusing that
+    // install is the registration's error. Forced: the start is held in
+    // its launch (its list already read) until the rule is recorded
+    // (checked: the launch went out without it). And a rule set while no
+    // container runs answers Ok: no start is asked to install it.
+    #[test]
+    fn a_rule_refused_in_the_install_after_its_launch_fails_its_registration() {
+        rt().block_on(a_rule_refused_in_the_install());
+    }
+
+    async fn a_rule_refused_in_the_install() {
+        let fake = Arc::new(Fake::default());
+        *fake.refused.lock().unwrap() = Some("refused.example".into());
+        let engine = an_engine(&fake).await;
+        let cell = a_box();
+        engine.intercept(&cell, http("first.example"), a_route()).await.expect("not running: recorded for the next start");
+        fake.launch.hold();
+        let run = cell.begin_run();
+        let starting = {
+            let (engine, cell) = (engine.clone(), cell.clone());
+            asyncrt::spawn(async move { engine.start(&cell, run, start_img()).await })
+        };
+        fake.launch.reached().await;
+        let registering = {
+            let (engine, cell) = (engine.clone(), cell.clone());
+            asyncrt::spawn(async move { engine.intercept(&cell, http("refused.example"), a_route()).await })
+        };
+        recorded(&cell, 2).await;
+        fake.launch.open();
+        starting.await.unwrap().expect("the launch itself is taken");
+        let registered = registering.await.unwrap();
+        assert_eq!(fake.launched.lock().unwrap().clone(), vec![http("first.example")], "the rule was not in the launch");
+        let error = format!("{:#}", registered.expect_err("the install's refusal answers the registration"));
+        assert!(error.contains("refused.example"), "{error}");
+    }
+
+    async fn a_rule_refused_in_its_launch() {
+        let fake = Arc::new(Fake::default());
+        *fake.refused.lock().unwrap() = Some("refused.example".into());
+        fake.image.hold();
+        let engine = an_engine(&fake).await;
+        let cell = a_box();
+        let run = cell.begin_run();
+        let starting = {
+            let (engine, cell) = (engine.clone(), cell.clone());
+            asyncrt::spawn(async move { engine.start(&cell, run, start_img()).await })
+        };
+        fake.image.reached().await;
+        let registering = {
+            let (engine, cell) = (engine.clone(), cell.clone());
+            asyncrt::spawn(async move { engine.intercept(&cell, http("refused.example"), a_route()).await })
+        };
+        recorded(&cell, 1).await;
+        fake.image.open();
+        let started = starting.await.unwrap();
+        let registered = registering.await.unwrap();
+        assert_eq!(fake.launched.lock().unwrap().clone(), vec![http("refused.example")], "the rule went out in the launch");
+        assert!(started.is_err(), "the engine refused the launch");
+        let error = format!("{:#}", registered.expect_err("the registration answers with the start's error"));
+        assert!(error.contains("refused.example"), "{error}");
+    }
 
     fn a_cell() -> CellContainer {
         CellContainer {
@@ -1574,9 +1881,8 @@ mod tests {
 
     // Goal (review of the stack, finding 2): a monitor() of a run keeps that
     // run's outcome through a later start, and never takes the later run's;
-    // an outcome no watcher holds goes at the next start; one read goes; a
-    // watcher whose isolate went cannot hold more than OUTCOMES_MAX. Replay:
-    // read twice, the same outcome.
+    // an outcome no watcher holds goes at the next start; one read goes.
+    // Replay: read twice, the same outcome.
     #[test]
     fn a_run_keeps_its_own_outcome_for_its_watchers() {
         let cell = a_cell();
@@ -1602,14 +1908,56 @@ mod tests {
         assert!(cell.ended(third).is_some());
         cell.unwatch(third);
         assert!(cell.ended(third).is_none());
-        // watchers that never read (their isolate went): bounded
-        for _ in 0..OUTCOMES_MAX * 2 {
-            let run = cell.begin_run();
-            cell.watch();
-            cell.record(run, exit(1));
-        }
+    }
+
+    // Goal (review round 2, finding 2): an outcome a live watcher still
+    // waits for is never pruned, however many there are: 70 runs, each
+    // watched and ended, all still readable after the next start.
+    #[test]
+    fn live_watched_outcomes_survive_past_64() {
+        let cell = a_cell();
+        let runs: Vec<u64> = (0..70)
+            .map(|_| {
+                let run = cell.begin_run();
+                assert_eq!(cell.watch(), run);
+                cell.record(run, exit(3));
+                run
+            })
+            .collect();
         cell.begin_run();
-        assert!(cell.outcomes.lock().unwrap().len() <= OUTCOMES_MAX);
+        for run in runs {
+            assert_eq!(cell.ended(run), Some(exit(3)), "run {run}'s live watcher still reads it");
+        }
+    }
+
+    // Goal (review round 2, finding 2): the outcomes only an earlier
+    // instance's watchers waited for (gone with it) go once a new instance
+    // makes its container; a run still running stays, and the new
+    // instance's watchers keep theirs.
+    #[test]
+    fn abandoned_outcomes_go_when_a_new_instance_comes() {
+        let cell = a_cell();
+        let abandoned: Vec<u64> = (0..70)
+            .map(|_| {
+                let run = cell.begin_run();
+                cell.watch();
+                cell.record(run, exit(3));
+                run
+            })
+            .collect();
+        let running = cell.begin_run();
+        cell.watch();
+        cell.activate();
+        for run in &abandoned {
+            assert_eq!(cell.ended(*run), None, "run {run}: its watcher's instance went");
+        }
+        assert!(cell.outcomes.lock().unwrap().contains_key(&running), "a run still running stays");
+        // the new instance watches it: its end is kept for it
+        assert_eq!(cell.watch(), running);
+        cell.record(running, exit(0));
+        cell.begin_run();
+        assert_eq!(cell.ended(running), Some(exit(0)));
+        assert_eq!(cell.outcomes.lock().unwrap().len(), 1, "that run's alone: the new one is unwatched");
     }
 
     #[test]

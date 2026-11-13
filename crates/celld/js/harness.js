@@ -2621,6 +2621,8 @@ class Container {
     // event settles the rest whose run ended (`_settleEnded`), as Cloudflare
     // settles monitor() when the container stops, whatever event runs.
     this._watching = [];
+    // fork: a new instance: the watches of an earlier one went with it
+    __container_activate(scope);
   }
   // The host's answer, not a JavaScript flag: a monitor() promise can be
   // dropped with its event, so the flag it would maintain could go stale.
