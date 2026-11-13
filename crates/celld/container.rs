@@ -802,59 +802,109 @@ pub async fn shutdown() {
 /// `monitor()` watchers whose runs ended.
 pub const CONTAINER_EXITED_URL: &str = "http://container.celld.internal/exited";
 
-/// fork: how many times a container's exit wake is tried, at most, while a
-/// `monitor()` of its run is left to hear it: about two minutes at the
-/// backoff's cap (`WAKE_BACKOFF_MAX`).
-const WAKE_TRIES_MAX: u32 = 30;
-const WAKE_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// fork: one try of an exit wake, as the object answered it.
+#[derive(Debug, PartialEq)]
+enum Wake {
+    /// The harness answered it (204): its event settled the ended runs'
+    /// watchers.
+    Acknowledged,
+    /// Refused or failed; tried again.
+    Refused(String),
+    /// The object is not on this node: its instance, and its watchers,
+    /// went with it.
+    Gone,
+}
+
+/// fork: how an exit wake's tries ended.
+#[derive(Debug, PartialEq)]
+enum Delivered {
+    Acknowledged,
+    Gone,
+    /// No live `monitor()` of the run was left to hear it.
+    NoWatcherLeft,
+}
+
+/// fork: the spacing of an exit wake's tries (a backoff doubling from
+/// `first` to `max`), and how long one try may take (`each`): a try that
+/// never answers is cut there and counts as refused.
+#[derive(Clone, Copy)]
+struct WakeTries {
+    first: Duration,
+    max: Duration,
+    each: Duration,
+}
+
+const WAKE_TRIES: WakeTries = WakeTries {
+    first: Duration::from_millis(100),
+    max: Duration::from_secs(5),
+    each: Duration::from_secs(10),
+};
+
+/// fork: tries `wake` until the object acknowledges it or is gone, while
+/// `awaited` says a live `monitor()` of the run is left to hear it, each try
+/// cut at `tries.each`. Not bounded by a count (review): a live watcher's
+/// `monitor()` must settle. The watcher's own life bounds it: its object's
+/// instance going ends `awaited` (`CellContainer::activate`) or leaves the
+/// object gone. Answers how it ended, and how many tries it took.
+async fn deliver_wake<W, F>(awaited: impl Fn() -> bool, wake: W, tries: WakeTries) -> (Delivered, u64)
+where
+    W: Fn() -> F,
+    F: std::future::Future<Output = Wake>,
+{
+    let mut delay = tries.first;
+    let mut tried = 0;
+    // Bounded by the watcher's life, above.
+    loop {
+        if !awaited() {
+            return (Delivered::NoWatcherLeft, tried);
+        }
+        tried += 1;
+        match asyncrt::timeout(tries.each, wake()).await {
+            Ok(Wake::Acknowledged) => return (Delivered::Acknowledged, tried),
+            Ok(Wake::Gone) => return (Delivered::Gone, tried),
+            Ok(Wake::Refused(why)) => tracing::debug!(tried, why = %why, "an exit wake was not acknowledged"),
+            Err(_) => tracing::debug!(tried, "an exit wake had no answer within its bound"),
+        }
+        asyncrt::sleep(delay).await;
+        delay = (delay * 2).min(tries.max);
+    }
+}
 
 /// fork: wakes the object whose container's run ended, so a `monitor()` an
 /// earlier event set, which could not keep that event alive, settles now,
 /// as Cloudflare settles it when the container stops. The wake goes past
 /// the object's request admission (`RuntimeManager::notify_cell`): its
-/// handlers in flight may be the ones waiting for it. It is tried again
-/// until the harness acknowledges it (204), while a watcher of the run is
-/// left to hear it and the object is on this node; past `WAKE_TRIES_MAX` it
-/// is left to the object's next event, said.
+/// handlers in flight may be the ones waiting for it. It is tried until
+/// acknowledged while a live watcher of the run is left (`deliver_wake`).
 async fn wake_cell(cell: &CellContainer, run: u64) {
     let runtime = CONFIG.read().unwrap().as_ref().and_then(|config| config.runtime_manager.clone());
     let Some(runtime) = runtime else {
         return;
     };
-    let mut delay = Duration::from_millis(100);
-    // Bounded by WAKE_TRIES_MAX.
-    for tried in 1..=WAKE_TRIES_MAX {
-        if !cell.awaited(run) {
-            return;
-        }
-        let wake = crate::engine_api::RuntimeFetch {
-            url: CONTAINER_EXITED_URL.to_string(),
-            method: "POST".to_string(),
-            body: crate::engine_api::RequestBody::Bytes(Bytes::new()),
-            headers: Vec::new(),
-            request_id: None,
-            order: None,
-            parent: None,
-        };
-        match runtime.notify_cell(cell.scope.clone(), wake).await {
-            Ok(Some(answer)) if answer.status == 204 => return,
-            Ok(None) => return,
-            Ok(Some(answer)) => {
-                tracing::debug!(cell = %cell.scope, tried, status = answer.status, "the container's exit wake was not acknowledged");
-            }
-            Err(error) => {
-                tracing::debug!(cell = %cell.scope, tried, error = %format!("{error:#}"), "the container's exit wake failed");
+    let wake = || {
+        let (runtime, scope) = (runtime.clone(), cell.scope.clone());
+        async move {
+            let wake = crate::engine_api::RuntimeFetch {
+                url: CONTAINER_EXITED_URL.to_string(),
+                method: "POST".to_string(),
+                body: crate::engine_api::RequestBody::Bytes(Bytes::new()),
+                headers: Vec::new(),
+                request_id: None,
+                order: None,
+                parent: None,
+            };
+            match runtime.notify_cell(scope, wake).await {
+                Ok(Some(answer)) if answer.status == 204 => Wake::Acknowledged,
+                Ok(Some(answer)) => Wake::Refused(format!("status {}", answer.status)),
+                Ok(None) => Wake::Gone,
+                Err(error) => Wake::Refused(format!("{error:#}")),
             }
         }
-        asyncrt::sleep(delay).await;
-        delay = (delay * 2).min(WAKE_BACKOFF_MAX);
+    };
+    let (delivered, tried) = deliver_wake(|| cell.awaited(run), wake, WAKE_TRIES).await;
+    if tried > 1 {
+        tracing::info!(cell = %cell.scope, run, tried, delivered = ?delivered, "a container's exit wake took more than one try");
     }
-    tracing::warn!(
-        event = "container_exit_wake_unacknowledged",
-        cell = %cell.scope,
-        run,
-        "a container's exit wake was not acknowledged: its monitor() settles at the object's next event"
-    );
 }
 
 /// Connect and load every image of the installed specs, ahead of the
@@ -2083,6 +2133,53 @@ mod tests {
         cell.begin_run();
         assert_eq!(cell.ended(running), Some(exit(0)));
         assert_eq!(cell.outcomes.lock().unwrap().len(), 1, "that run's alone: the new one is unwatched");
+    }
+
+    const QUICK: WakeTries = WakeTries {
+        first: Duration::from_millis(1),
+        max: Duration::from_millis(2),
+        each: Duration::from_millis(50),
+    };
+
+    // Goal (review round 2, finding 3): a wake refused many times (50, past
+    // the 30 tries the loop once gave up at), one of them never answering
+    // (cut at its bound, then tried again), goes through once the object
+    // takes it, while its watcher lives.
+    #[test]
+    fn a_wake_goes_through_after_many_refused_tries() {
+        rt().block_on(async {
+            let tries = AtomicU64::new(0);
+            let wake = || {
+                let n = tries.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if n == 3 {
+                        return std::future::pending::<Wake>().await;
+                    }
+                    if n <= 50 {
+                        Wake::Refused(format!("try {n}"))
+                    } else {
+                        Wake::Acknowledged
+                    }
+                }
+            };
+            assert_eq!(deliver_wake(|| true, wake, QUICK).await, (Delivered::Acknowledged, 51));
+        });
+    }
+
+    // Goal: tries stop once no live watcher of the run is left (here after
+    // 5), or at once when the object is gone; never acknowledged, either.
+    #[test]
+    fn a_wake_stops_once_no_live_watcher_is_left() {
+        rt().block_on(async {
+            let tries = AtomicU64::new(0);
+            let awaited = || tries.load(Ordering::SeqCst) < 5;
+            let wake = || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                async { Wake::Refused("refused".into()) }
+            };
+            assert_eq!(deliver_wake(awaited, wake, QUICK).await, (Delivered::NoWatcherLeft, 5));
+            assert_eq!(deliver_wake(|| true, || async { Wake::Gone }, QUICK).await, (Delivered::Gone, 1));
+        });
     }
 
     #[test]

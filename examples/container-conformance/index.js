@@ -491,8 +491,8 @@ export default {
     let saturate;
     try {
       await full.fetch("http://conformance/saturate/start");
-      // waves at 0, 2 and 4 s, so a slot an earlier answer freed is held
-      // again when the container ends, 6 s on
+      // waves at 0, 2, 4 and 5.5 s, so a slot an earlier answer freed is
+      // held again when the container ends, 6 s on
       const wave = () => Array.from({ length: 80 }, () =>
         full.fetch("http://conformance/saturate/wait").then(async (r) => (r.status === 200 ? await r.text() : `status ${r.status}`)));
       const waits = [...wave()];
@@ -500,6 +500,14 @@ export default {
       waits.push(...wave());
       await sleep(2000);
       waits.push(...wave());
+      await sleep(1500);
+      // the precondition: refused as the container ends, the object's
+      // admission full (an admitted wait answers only after the end)
+      const last = await Promise.race([
+        Promise.all(wave().map((w) => Promise.race([w, sleep(300).then(() => "waiting")]))),
+        sleep(1000).then(() => []),
+      ]);
+      const refusedLast = last.filter((s) => s === "status 503").length;
       const said = await Promise.race([
         Promise.all(waits),
         sleep(30000).then(() => null),
@@ -507,9 +515,14 @@ export default {
       const counts = {};
       for (const s of said ?? []) counts[s] = (counts[s] ?? 0) + 1;
       const heard = said !== null && said.every((s) => s === "exit 3" || s === "status 503") && (counts["exit 3"] ?? 0) > 0;
-      saturate = heard
-        ? { ok: true, ms: Date.now() - t2, detail: counts }
-        : { ok: false, ms: Date.now() - t2, error: said === null ? "waits still pending after 30 s" : `expected: ${JSON.stringify(counts)}` };
+      // on a runtime with no request limit (Cloudflare) none is refused,
+      // and the check is of the wait alone
+      const admissionFull = refusedLast > 0 || (counts["status 503"] ?? 0) === 0;
+      saturate = !admissionFull
+        ? { ok: false, ms: Date.now() - t2, error: `admission was not full as the container ended: ${JSON.stringify({ refusedLast, counts })}` }
+        : heard
+          ? { ok: true, ms: Date.now() - t2, detail: { ...counts, refusedLast } }
+          : { ok: false, ms: Date.now() - t2, error: said === null ? "waits still pending after 30 s" : `expected: ${JSON.stringify(counts)}` };
     } catch (error) {
       saturate = { ok: false, ms: Date.now() - t2, error: error?.message ?? String(error) };
     }
