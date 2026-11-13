@@ -593,18 +593,19 @@ pub(crate) trait Backend: Send + Sync {
 
     /// fork: shows run `run`'s output as the container writes it, each line
     /// an event (`container_output`), as Cloudflare shows a container's
-    /// logs. The answer, awaited once the run has ended and before its end
-    /// is told, shows the last of it. `from_now` skips what the container
-    /// wrote before (a container adopted from an earlier owner). `None`
-    /// for an engine whose containers' output stays in its own logs
-    /// (Docker's, `docker logs`).
+    /// logs. The answer, called once the run has ended and awaited before
+    /// its end is told, stops that, showing the last of it when asked to.
+    /// `from_now` skips what the container wrote before (a container
+    /// adopted from an earlier owner). `None` for an engine whose
+    /// containers' output stays in its own logs (Docker's, `docker logs`).
     fn follow_output(&self, _name: &str, _cell: &str, _run: u64, _from_now: bool) -> Option<OutputEnd> {
         None
     }
 }
 
-/// fork: the end of a run's output (`Backend::follow_output`).
-pub(crate) type OutputEnd = futures_util::future::BoxFuture<'static, ()>;
+/// fork: the end of a run's output (`Backend::follow_output`): its last
+/// read when `true`.
+pub(crate) type OutputEnd = Box<dyn FnOnce(bool) -> futures_util::future::BoxFuture<'static, ()> + Send>;
 
 pub struct ContainerEngine {
     backend: Arc<dyn Backend>,
@@ -1241,7 +1242,9 @@ impl ContainerEngine {
     /// for `run`; a later run's start has already replaced the state.
     /// fork: the run's output is shown meanwhile (`follow_output`), its last
     /// before the exit is told: the object that hears it may restart the
-    /// container, and its output goes with it. `adopted`: a container an
+    /// container, and its output goes with it. Not when a later run has
+    /// begun (a `destroy()`, then a `start()`): the name is that run's, and
+    /// the destroyed run's output went with it. `adopted`: a container an
     /// earlier owner started, whose output so far was that owner's to show.
     fn watch_exit(&self, cell: &Arc<CellContainer>, run: u64, adopted: bool) {
         let backend = self.backend.clone();
@@ -1253,7 +1256,8 @@ impl ContainerEngine {
                 .await
                 .map_err(|error| format!("{error:#}"));
             if let Some(end) = output {
-                end.await;
+                let latest = cell_.state.lock().unwrap().run == run;
+                end(latest).await;
             }
             let destroyed = {
                 let mut state = cell_.state.lock().unwrap();

@@ -455,17 +455,20 @@ impl Backend for KrunBackend {
                 }
             })
         };
-        Some(Box::pin(async move {
-            // Cancelled only at its read of the engine: the output is held
-            // under a lock no await is made under.
-            reader.abort();
-            let _ = asyncrt::timeout(OUTPUT_LAST_READ_MAX, read_output(&api, &name, &output, Read::Last)).await;
+        Some(Box::new(move |read_last: bool| -> futures_util::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                // Cancelled only at its read of the engine: the output is
+                // held under a lock no await is made under.
+                reader.abort();
+                if read_last {
+                    let _ = asyncrt::timeout(OUTPUT_LAST_READ_MAX, read_output(&api, &name, &output, Read::Last)).await;
+                }
+            })
         }))
     }
 }
 
-/// fork: one run's output as shown so far: each stream's tail as the engine
-/// last answered it, and its line not yet ended.
+/// fork: one run's output as shown so far: where each stream was read to.
 struct Output {
     cell: String,
     run: u64,
