@@ -49,15 +49,29 @@ pub(super) fn op_container_running(
     rv.set(v8::Boolean::new(scope, running).into());
 }
 
-/// fork: the run a `monitor()` called now waits on: the current one.
-pub(super) fn op_container_run(
+/// fork: registers a `monitor()` called now on the current run, whose
+/// outcome is kept until it reads it (`__container_unwatch`): that run.
+pub(super) fn op_container_watch(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
-    let run = ready_cell(&cell).map_or(0, |cell| cell.current_run());
+    let run = ready_cell(&cell).map_or(0, |cell| cell.watch());
     rv.set(v8::Number::new(scope, run as f64).into());
+}
+
+/// fork: a `monitor()` of run `run` has read its outcome.
+pub(super) fn op_container_unwatch(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = string_arg(scope, &args, 0);
+    let run = number_arg(scope, &args, 1);
+    if let Some(cell) = ready_cell(&cell) {
+        cell.unwatch(run);
+    }
 }
 
 /// fork: how run `run` ended, as `__container_monitor` settles
@@ -218,7 +232,8 @@ pub(super) fn op_container_monitor(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
-    let run = ready_cell(&cell).map_or(0, |cell| cell.current_run());
+    // fork: the run its `monitor()` registered (`__container_watch`)
+    let run = number_arg(scope, &args, 1);
     let async_id = asyncrt::enqueue_unrefed(async move {
         let (engine, cell) = cell_for(&cell).await?;
         let exit = engine.monitor(&cell, run).await?;
