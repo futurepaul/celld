@@ -13,8 +13,9 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 export class Interceptor extends WorkerEntrypoint {
   async fetch(request) {
     const url = new URL(request.url);
+    const tag = this.ctx.props?.tag;
     return new Response(
-      `intercepted ${request.method} ${url.protocol}//${url.host}${url.pathname}`,
+      `${tag ? `${tag}: ` : ""}intercepted ${request.method} ${url.protocol}//${url.host}${url.pathname}`,
     );
   }
 }
@@ -92,6 +93,18 @@ export class Conformance extends DurableObject {
     await check("images", () => expect(typeof image === "string" && image.length > 0, c.images));
     await check("not_running_at_first", async () =>
       expect(!c.running && (await c.inspect()) === null, { running: c.running }));
+    // An intercept set while the start is under way, as an object sets its
+    // own right after `start()`, applies once the container is up. First of
+    // the intercepts: the catch-all below would answer any host.
+    await check("interceptOutboundHttp_while_starting", async () => {
+      c.start({ image, enableInternet: false });
+      await c.interceptOutboundHttp("early.example", this.ctx.exports.Interceptor);
+      await listening();
+      const [, body] = await get(`/fetch?url=${encodeURIComponent("http://early.example/early")}`);
+      const r = JSON.parse(body);
+      return expect(r.body === "intercepted GET http://early.example/early", r);
+    });
+    await stop();
     await check("start", async () => {
       c.start({
         image,
@@ -189,6 +202,18 @@ export class Conformance extends DurableObject {
       const r = JSON.parse(body);
       return expect(r.body === "intercepted GET http://intercepted.example/hello", r);
     });
+    // A host intercepted again takes the new binding in its place, and
+    // counts once: the Sandbox SDK's DirectoryBackup registers its host
+    // again for each grant. 70 times is 140 entries, past the 128 a
+    // container takes.
+    await check("interceptOutboundHttp_again_replaces", async () => {
+      for (let i = 1; i <= 70; i++) {
+        await c.interceptOutboundHttp("intercepted.example", this.ctx.exports.Interceptor({ props: { tag: `again ${i}` } }));
+      }
+      const [, body] = await get(`/fetch?url=${encodeURIComponent("http://intercepted.example/hello")}`);
+      const r = JSON.parse(body);
+      return expect(r.body === "again 70: intercepted GET http://intercepted.example/hello", r);
+    });
     await check("interceptOutboundHttps", async () => {
       await c.interceptOutboundHttps("secure.example", this.ctx.exports.Interceptor);
       const [, body] = await get(`/fetch?url=${encodeURIComponent("https://secure.example/tls")}`);
@@ -258,6 +283,21 @@ export class Conformance extends DurableObject {
       return expect((await ended) === "boom", await ended);
     });
     await stop();
+    // An intercept set while a start is under way answers for the rule the
+    // engine took, or fails: one it refuses (a host with an underscore) is
+    // the call's error, never a success the guest finds nothing behind.
+    // Last, since a runtime may keep the refused rule for the object's life.
+    await check("interceptOutboundHttp_refused_while_starting", async () => {
+      c.start({ image, enableInternet: false });
+      let refused = null;
+      try {
+        await c.interceptOutboundHttp("not_a_host.example", this.ctx.exports.Interceptor);
+      } catch (error) {
+        refused = error?.message ?? String(error);
+      }
+      await stop();
+      return expect(refused !== null, { refused });
+    });
 
     const verdicts = Object.values(results);
     const summary = {
