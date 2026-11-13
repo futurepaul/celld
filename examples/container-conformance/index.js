@@ -14,6 +14,12 @@ export class Interceptor extends WorkerEntrypoint {
   async fetch(request) {
     const url = new URL(request.url);
     const tag = this.ctx.props?.tag;
+    if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.addEventListener("message", (e) => server.send(`intercepted ${url.host}${url.pathname}: ${e.data}`));
+      return new Response(null, { status: 101, webSocket: client });
+    }
     return new Response(
       `${tag ? `${tag}: ` : ""}intercepted ${request.method} ${url.protocol}//${url.host}${url.pathname}`,
     );
@@ -201,6 +207,13 @@ export class Conformance extends DurableObject {
       const [, body] = await get(`/fetch?url=${encodeURIComponent("http://intercepted.example/hello")}`);
       const r = JSON.parse(body);
       return expect(r.body === "intercepted GET http://intercepted.example/hello", r);
+    });
+    // A WebSocket to an intercepted host reaches its binding, which answers it.
+    await check("interceptOutboundHttp_websocket", async () => {
+      await c.interceptOutboundHttp("socket.example", this.ctx.exports.Interceptor);
+      const [, body] = await get(`/ws?url=${encodeURIComponent("ws://socket.example/talk")}&say=hello`);
+      const r = JSON.parse(body);
+      return expect(r.said === "intercepted socket.example/talk: hello", r);
     });
     // A host intercepted again takes the new binding in its place, and
     // counts once: the Sandbox SDK's DirectoryBackup registers its host

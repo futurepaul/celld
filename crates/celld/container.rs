@@ -26,6 +26,7 @@
 //! never talks to a registry.
 
 use crate::asyncrt;
+pub use crate::container_krun::{answer_intercepted_websockets, InterceptBody, InterceptedWebSocket};
 use anyhow::anyhow;
 use bytes::Bytes;
 use serde_json::{json, Value};

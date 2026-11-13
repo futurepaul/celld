@@ -765,7 +765,31 @@ fn recv_with_fd(sock: RawFd, buf: &mut [u8]) -> std::io::Result<(usize, Option<O
 }
 
 /// `Send`, not `Sync`: a service response streams from a `Send` source.
-type InterceptBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+pub type InterceptBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+/// fork: how an intercepted WebSocket upgrade is answered: given the
+/// engine's request (its connection upgradable) and the service call to the
+/// intercept's binding, the response to send, a 101 whose socket is pumped
+/// once the engine hands its connection over. The node's own WebSocket
+/// machinery answers it as it answers a client's upgrade, and it lives in
+/// the binary (`main/websocket.rs`), so the binary sets it at start
+/// (`answer_intercepted_websockets`). On Cloudflare a container's
+/// WebSocket reaches the intercept's binding as any request does.
+pub type InterceptedWebSocket = Arc<
+    dyn Fn(
+            hyper::Request<hyper::body::Incoming>,
+            crate::engine_api::ServiceFetch,
+        ) -> futures_util::future::BoxFuture<'static, hyper::Response<InterceptBody>>
+        + Send
+        + Sync,
+>;
+
+static INTERCEPTED_WEBSOCKET: std::sync::OnceLock<InterceptedWebSocket> = std::sync::OnceLock::new();
+
+/// fork: sets how intercepted WebSocket upgrades are answered, once.
+pub fn answer_intercepted_websockets(answer: InterceptedWebSocket) {
+    let _ = INTERCEPTED_WEBSOCKET.set(answer);
+}
 
 /// celld's intercept socket: the engine's egress proxy sends each
 /// intercepted request here, naming the container and the intercept.
@@ -796,8 +820,11 @@ fn serve_intercepts(
                     let runtime = runtime.clone();
                     async move { Ok::<_, std::convert::Infallible>(intercepted(runtime, req).await) }
                 });
+                // with upgrades: a WebSocket's connection is handed over
+                // on its 101 (`answer_intercepted_websockets`)
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .with_upgrades()
                     .await;
             });
         }
@@ -865,6 +892,28 @@ async fn intercepted(
             )
         })
         .collect();
+    let entrypoint = route.entrypoint.map(|name| crate::WorkerFetchEntrypoint {
+        name,
+        props: route.props,
+    });
+    // fork: a WebSocket's upgrade goes to the binding as the node answers a
+    // client's (`InterceptedWebSocket`); its request has no body.
+    if crate::cell_dispatch::requests_websocket_upgrade(&headers) {
+        let Some(answer) = INTERCEPTED_WEBSOCKET.get() else {
+            return plain(502, "this node answers no intercepted WebSocket".into());
+        };
+        let call = crate::engine_api::ServiceFetch {
+            generation: route.generation,
+            script: route.script,
+            entrypoint,
+            url,
+            method,
+            body: crate::engine_api::RequestBody::Bytes(Bytes::new()),
+            headers,
+            cancel: None,
+        };
+        return answer(req, call).await;
+    }
     let body = match http_body_util::Limited::new(req.into_body(), INTERCEPT_BODY_BYTES_MAX)
         .collect()
         .await
@@ -880,10 +929,7 @@ async fn intercepted(
     let call = crate::engine_api::ServiceFetch {
         generation: route.generation,
         script: route.script,
-        entrypoint: route.entrypoint.map(|name| crate::WorkerFetchEntrypoint {
-            name,
-            props: route.props,
-        }),
+        entrypoint,
         url,
         method,
         body: crate::engine_api::RequestBody::Bytes(body),
