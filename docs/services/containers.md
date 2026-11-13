@@ -113,7 +113,8 @@ container counts as up, in its launch or after it, and an installation that
 fails (a launch the engine refuses included) is the call's error. A host intercepted
 again takes the new binding in its place, counting once toward the 128 entries.
 A WebSocket upgrade to an intercepted host reaches the binding, which answers it
-as it answers a client's. `getTcpPort()` reaches a port through a loopback listener per port,
+as it answers a client's. A body of 1 MiB or more, or of no declared length,
+streams to the binding, at most `CELLD_MAX_REQUEST_BODY_BYTES`. `getTcpPort()` reaches a port through a loopback listener per port,
 whose connections take a socket from the engine, TCP over the VM's network
 interface or a relay to the guest's loopback.
 

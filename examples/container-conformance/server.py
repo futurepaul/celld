@@ -4,6 +4,7 @@
 #   /fetch?url=  an outbound request from inside, its status and body
 #   /write?v=    a marker file in the writable root; /read reads it back
 #   /ws?url=&say= a WebSocket from inside: one text frame said, one answered
+#   /post?url=&mb= an outbound POST of that many MiB of zeroes, its answer
 # SIGTERM exits with 42, so signal() and monitor() can be told apart.
 import base64
 import http.server
@@ -74,6 +75,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif url.path == "/ws":
             try:
                 body = json.dumps(ws_say(query["url"][0], query["say"][0])).encode()
+            except Exception as error:  # the Worker reads the failure
+                body = json.dumps({"error": str(error)}).encode()
+        elif url.path == "/post":
+            try:
+                data = bytes(int(query["mb"][0]) << 20)
+                with urllib.request.urlopen(urllib.request.Request(query["url"][0], data=data, method="POST"), timeout=60) as r:
+                    body = json.dumps({"status": r.status, "body": r.read().decode()}).encode()
             except Exception as error:  # the Worker reads the failure
                 body = json.dumps({"error": str(error)}).encode()
         elif url.path == "/write":

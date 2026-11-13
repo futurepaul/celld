@@ -20,6 +20,11 @@ export class Interceptor extends WorkerEntrypoint {
       server.addEventListener("message", (e) => server.send(`intercepted ${url.host}${url.pathname}: ${e.data}`));
       return new Response(null, { status: 101, webSocket: client });
     }
+    if (request.method === "POST") {
+      let bytes = 0;
+      for await (const chunk of request.body) bytes += chunk.byteLength;
+      return new Response(`intercepted POST ${url.host}${url.pathname}: ${bytes} bytes`);
+    }
     return new Response(
       `${tag ? `${tag}: ` : ""}intercepted ${request.method} ${url.protocol}//${url.host}${url.pathname}`,
     );
@@ -214,6 +219,12 @@ export class Conformance extends DurableObject {
       const [, body] = await get(`/ws?url=${encodeURIComponent("ws://socket.example/talk")}&say=hello`);
       const r = JSON.parse(body);
       return expect(r.said === "intercepted socket.example/talk: hello", r);
+    });
+    // A request body larger than any held whole (40 MiB) reaches the binding.
+    await check("interceptOutboundHttp_large_body", async () => {
+      const [, body] = await get(`/post?url=${encodeURIComponent("http://intercepted.example/big")}&mb=40`, 60000);
+      const r = JSON.parse(body);
+      return expect(r.body === `intercepted POST intercepted.example/big: ${40 << 20} bytes`, r);
     });
     // A host intercepted again takes the new binding in its place, and
     // counts once: the Sandbox SDK's DirectoryBackup registers its host
