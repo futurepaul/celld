@@ -80,7 +80,8 @@ export class Conformance extends DurableObject {
     // (`monitor_across_a_restart`).
     if (step === "/restart/start") {
       await this.ctx.storage.delete("restart");
-      c.start({ image: c.images.base, enableInternet: false });
+      // it ends on its own, 8 s on: no event's kill needs to go out
+      c.start({ image: c.images.base, enableInternet: false, entrypoint: ["sh", "-c", "sleep 8; exit 3"] });
       c.monitor().then(
         () => this.ctx.storage.put("restart", "resolved"),
         (error) => this.ctx.storage.put("restart", `exit ${error.exitCode}`),
@@ -88,8 +89,6 @@ export class Conformance extends DurableObject {
       return new Response("started");
     }
     if (step === "/restart/race") {
-      c.signal(9);
-      await sleep(20); // the signal goes out
       // Held in this turn while the container stops, so no other event (an
       // exit's wake included) runs between its end and the next start; a
       // runtime whose `running` moves only between turns ends the loop by
@@ -455,11 +454,11 @@ export default {
     let restart;
     try {
       await at("/restart/start");
-      await sleep(5000);
+      await sleep(6000);
       const raced = await (await at("/restart/race")).json();
       await sleep(3000);
       const seen = { ...(await (await at("/restart/ended")).json()), raced };
-      restart = seen.ended === "exit 137"
+      restart = seen.ended === "exit 3"
         ? { ok: true, ms: Date.now() - t1, detail: seen }
         : { ok: false, ms: Date.now() - t1, error: `expected: ${JSON.stringify(seen)}` };
     } catch (error) {
