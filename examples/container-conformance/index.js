@@ -187,6 +187,21 @@ export class Conformance extends DurableObject {
       return expect((await p.exitCode) === 0, "exit 0");
     });
     await stop();
+    // An intercept set right after start(), then an exec at once, with no
+    // wait for the container's server: the exec's request finds its host
+    // intercepted, every time (three starts).
+    await check("intercept_then_exec_while_starting", async () => {
+      const said = [];
+      for (let i = 0; i < 3; i++) {
+        c.start({ image, enableInternet: false });
+        await c.interceptOutboundHttp(`race${i}.example`, this.ctx.exports.Interceptor);
+        const p = await c.exec(["wget", "-qO-", "-T", "5", `http://race${i}.example/x`]);
+        const o = await p.output();
+        said.push({ code: o.exitCode, out: new TextDecoder().decode(o.stdout), err: new TextDecoder().decode(o.stderr) });
+        await stop();
+      }
+      return expect(said.every((r, i) => r.code === 0 && r.out === `intercepted GET http://race${i}.example/x`), said);
+    });
     await check("start", async () => {
       c.start({
         image,

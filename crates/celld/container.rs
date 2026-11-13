@@ -1381,8 +1381,11 @@ impl ContainerEngine {
     ) -> anyhow::Result<Arc<ExecProcess>> {
         // fork: an exec while the start is under way waits for it, as on
         // Cloudflare, where exec() on a container still starting runs once it
-        // is up; the krun engine refuses one (409, still starting). Bounded by
-        // the start, which ends either way (`up`).
+        // is up; the krun engine refuses one (409, still starting). Up is the
+        // start's end (`up`), after it installed the intercepts set while it
+        // ran, never its container's start alone, or an exec could reach a
+        // host before its intercept. Bounded by the start, which ends either
+        // way.
         let mut up = cell.up.subscribe();
         loop {
             {
@@ -1390,7 +1393,7 @@ impl ContainerEngine {
                 if !state.running {
                     return Err(anyhow!("exec() requires a running container."));
                 }
-                if state.info.started {
+                if *up.borrow_and_update() >= state.run {
                     break;
                 }
             }
