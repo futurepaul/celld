@@ -73,6 +73,21 @@ mod frames {
 const INTERCEPT_WHOLE_BYTES_MAX: u64 = 1 << 20;
 /// A `ports.sock` reply, at most.
 const PORT_REPLY_BYTES_MAX: usize = 4096;
+/// fork: how often a running guest's output is read. The engine keeps the
+/// tail of each stream (`GET /v1/containers/{name}/logs`, its last 64 KiB)
+/// and offers no stream of it, so output past that between two reads is
+/// missed, and said to be.
+const OUTPUT_READ_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// fork: the last read of a run's output, once it has ended, at most: the
+/// run's end waits for it, so it is bounded.
+const OUTPUT_LAST_READ_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+/// fork: the bytes of each stream the engine's logs answer (its
+/// `LOG_TAIL_BYTES`): a first read this long may have missed output.
+const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+/// fork: the bytes at the end of one read that a later read is matched by.
+const OUTPUT_ANCHOR_BYTES: usize = 256;
+/// fork: a line of output as one event, at most; a longer one is cut there.
+const OUTPUT_LINE_BYTES_MAX: usize = 16 * 1024;
 /// A unix socket's path, at most: Linux's `sun_path` holds 108 bytes, the
 /// last a NUL.
 const SOCKET_PATH_BYTES_MAX: usize = 107;
@@ -420,6 +435,195 @@ impl Backend for KrunBackend {
     fn close(&self) {
         let _ = std::fs::remove_file(&self.intercepts);
     }
+
+    fn follow_output(&self, name: &str, cell: &str, run: u64, from_now: bool) -> Option<crate::container::OutputEnd> {
+        let output = Arc::new(Mutex::new(Output::new(cell, run)));
+        let (api, name) = (self.api.clone(), name.to_string());
+        let reader = {
+            let (api, name, output) = (api.clone(), name.clone(), output.clone());
+            asyncrt::spawn(async move {
+                if from_now {
+                    read_output(&api, &name, &output, Read::Unshown).await;
+                }
+                // Bounded by the run: the engine answers 404 once the
+                // container is gone, and the run's end aborts it before.
+                loop {
+                    asyncrt::sleep(OUTPUT_READ_EVERY).await;
+                    if !read_output(&api, &name, &output, Read::Shown).await {
+                        return;
+                    }
+                }
+            })
+        };
+        Some(Box::new(move |read_last: bool| -> futures_util::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                // Cancelled only at its read of the engine: the output is
+                // held under a lock no await is made under.
+                reader.abort();
+                if read_last {
+                    let _ = asyncrt::timeout(OUTPUT_LAST_READ_MAX, read_output(&api, &name, &output, Read::Last)).await;
+                }
+            })
+        }))
+    }
+}
+
+/// fork: one run's output as shown so far: where each stream was read to.
+struct Output {
+    cell: String,
+    run: u64,
+    stdout: OutputCursor,
+    stderr: OutputCursor,
+}
+
+impl Output {
+    fn new(cell: &str, run: u64) -> Output {
+        Output {
+            cell: cell.to_string(),
+            run,
+            stdout: OutputCursor::default(),
+            stderr: OutputCursor::default(),
+        }
+    }
+
+    /// A newer read of both streams: the lines it ends, shown when `show`;
+    /// `last`, the run's last read, shows the rest too.
+    fn advance(&mut self, stdout: &str, stderr: &str, show: bool, last: bool) {
+        let (cell, run) = (self.cell.as_str(), self.run);
+        for (stream, cursor, tail) in [("stdout", &mut self.stdout, stdout), ("stderr", &mut self.stderr, stderr)] {
+            let (mut lines, missed) = cursor.advance(tail.as_bytes());
+            if last {
+                lines.extend(cursor.rest(tail.as_bytes()));
+            }
+            if !show {
+                continue;
+            }
+            if missed {
+                tracing::warn!(
+                    event = "container_output_missed",
+                    cell,
+                    run,
+                    stream,
+                    "the container wrote more than the engine keeps between two reads: some of its output is not shown"
+                );
+            }
+            for line in lines {
+                tracing::info!(event = "container_output", cell, run, stream, "{line}");
+            }
+        }
+    }
+}
+
+/// fork: one stream of a run's output, read as the engine's tail of it.
+#[derive(Default)]
+struct OutputCursor {
+    /// The tail the last read answered, up to the end of its last line: a
+    /// line still being written (its last character perhaps in part, which
+    /// the engine's lossy decoding replaces) is taken once it has ended.
+    tail: Vec<u8>,
+    /// Whether a read has answered yet.
+    read: bool,
+}
+
+impl OutputCursor {
+    /// A newer tail of the stream: the lines it ends, and whether output
+    /// was missed before it (nothing of the last read is in it, or the
+    /// first read is a whole tail).
+    fn advance(&mut self, next: &[u8]) -> (Vec<String>, bool) {
+        let (from, mut missed) = new_since(&self.tail, next);
+        missed |= !self.read && next.len() >= OUTPUT_TAIL_BYTES;
+        self.read = true;
+        let fresh = &next[from..];
+        let mut taken = fresh.iter().rposition(|b| *b == b'\n').map_or(0, |at| at + 1);
+        // A line past the cap is cut there, so none is held for ever.
+        if taken == 0 && fresh.len() >= OUTPUT_LINE_BYTES_MAX {
+            taken = OUTPUT_LINE_BYTES_MAX;
+        }
+        let lines = fresh[..taken]
+            .split_inclusive(|b| *b == b'\n')
+            .flat_map(|line| line.strip_suffix(b"\n").unwrap_or(line).chunks(OUTPUT_LINE_BYTES_MAX))
+            .map(text)
+            .collect();
+        self.tail = next[..from + taken].to_vec();
+        (lines, missed)
+    }
+
+    /// The line not yet ended in `next`, the run's last read: the rest of
+    /// the stream.
+    fn rest(&mut self, next: &[u8]) -> Option<String> {
+        let (from, _) = new_since(&self.tail, next);
+        self.tail = next.to_vec();
+        (from < next.len()).then(|| text(&next[from..]))
+    }
+}
+
+/// A line of output as text, without its carriage return.
+fn text(line: &[u8]) -> String {
+    String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line)).into_owned()
+}
+
+/// Where the output new since `last` begins in `next`, two reads of one
+/// stream's tail, and whether output was missed between them. While the
+/// stream is shorter than the tail, `next` begins as `last` does. Past it,
+/// `last`'s end is found in `next`: the latest place before which `next`
+/// holds the last of `last`, matched by `last`'s final bytes first. The
+/// engine decodes its tail lossily, so a tail that begins in a character
+/// begins with a replacement for it, which the match skips.
+fn new_since(last: &[u8], next: &[u8]) -> (usize, bool) {
+    if next.starts_with(last) {
+        return (last.len(), false);
+    }
+    const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
+    let anchor = &last[last.len().saturating_sub(OUTPUT_ANCHOR_BYTES)..];
+    // Bounded by `next`'s length, one step back each pass.
+    let mut end = next.len();
+    while end >= anchor.len() && !anchor.is_empty() {
+        if next[end - anchor.len()..end] == *anchor {
+            let held = &next[..end];
+            let held = held.strip_prefix(REPLACEMENT).unwrap_or(held);
+            if last.ends_with(held) {
+                return (end, false);
+            }
+        }
+        end -= 1;
+    }
+    (0, true)
+}
+
+/// fork: what one read of a run's output does with it.
+#[derive(Clone, Copy, PartialEq)]
+enum Read {
+    /// Takes it as already shown (a container adopted from an earlier
+    /// owner, whose output that owner showed).
+    Unshown,
+    /// Shows the lines it ends.
+    Shown,
+    /// The run's last: shows the rest too.
+    Last,
+}
+
+/// One read of a run's output from the engine: whether the container is
+/// still there to read again. A read that failed is tried at the next.
+async fn read_output(api: &Docker, name: &str, output: &Mutex<Output>, read: Read) -> bool {
+    let reply = match api.call("GET", &format!("/v1/containers/{name}/logs"), None).await {
+        Ok(reply) => reply,
+        Err(_) => return true,
+    };
+    if reply.status.as_u16() == 404 {
+        return false;
+    }
+    if !reply.status.is_success() {
+        return true;
+    }
+    let Ok(logs) = reply.json() else {
+        return true;
+    };
+    let stream = |name: &str| logs.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+    output
+        .lock()
+        .unwrap()
+        .advance(&stream("stdout"), &stream("stderr"), read != Read::Unshown, read == Read::Last);
+    true
 }
 
 /// fork: the images `celld dev` built into Docker's store (each under the
@@ -835,6 +1039,91 @@ fn serve_intercepts(
     Ok(())
 }
 
+/// fork: one intercepted request's start and end in the node's log, under
+/// an id of its own: `container_intercept` as it reaches the node, then
+/// `container_intercept_answered` with its answer's status, or
+/// `container_intercept_dropped` when the guest's request goes away before
+/// the binding answers (its connection closed). Its path, never its query.
+struct InterceptLog {
+    id: u64,
+    started_us: u64,
+    ended: bool,
+}
+
+static INTERCEPT_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl InterceptLog {
+    fn start(
+        cell: &str,
+        run: u64,
+        index: usize,
+        route: &crate::container::ServiceRoute,
+        method: &str,
+        host: &str,
+        path: &str,
+    ) -> InterceptLog {
+        let id = INTERCEPT_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            event = "container_intercept",
+            intercept = id,
+            cell,
+            run,
+            index,
+            binding = %route.script,
+            entrypoint = route.entrypoint.as_deref().unwrap_or("default"),
+            method,
+            host,
+            path,
+            "a container's request reached its intercept"
+        );
+        InterceptLog {
+            id,
+            started_us: asyncrt::mono_us(),
+            ended: false,
+        }
+    }
+
+    fn ms(&self) -> u64 {
+        asyncrt::mono_us().saturating_sub(self.started_us) / 1000
+    }
+
+    fn answered(&mut self, status: u16) {
+        self.ended = true;
+        tracing::info!(
+            event = "container_intercept_answered",
+            intercept = self.id,
+            status,
+            ms = self.ms(),
+            "the intercept's binding answered"
+        );
+    }
+
+    fn failed(&mut self, error: &anyhow::Error) {
+        self.ended = true;
+        tracing::warn!(
+            event = "container_intercept_answered",
+            intercept = self.id,
+            status = 502,
+            ms = self.ms(),
+            error = %format!("{error:#}"),
+            "the intercept's binding failed"
+        );
+    }
+}
+
+impl Drop for InterceptLog {
+    fn drop(&mut self) {
+        if !self.ended {
+            tracing::warn!(
+                event = "container_intercept_dropped",
+                intercept = self.id,
+                ms = self.ms(),
+                "the container's request went away before its binding answered"
+            );
+        }
+    }
+}
+
 fn plain(status: u16, text: String) -> hyper::Response<InterceptBody> {
     use http_body_util::BodyExt;
     let mut r = hyper::Response::new(
@@ -868,7 +1157,7 @@ async fn intercepted(
     let Some(runtime) = runtime else {
         return plain(502, "no Worker runtime on this node".into());
     };
-    let Some(route) =
+    let Some((route, cell, run)) =
         crate::container::engine_if_ready().and_then(|e| e.intercept_route(&container, index))
     else {
         return plain(502, format!("no intercept {index} for {container}"));
@@ -884,6 +1173,10 @@ async fn intercepted(
         .unwrap_or_else(|| "/".into());
     let url = format!("{scheme}://{host}{path}");
     let method = req.method().as_str().to_string();
+    // fork: the request's start and its end (its answer's head, or the
+    // request going away before it) are logged under its cell, run and
+    // binding: a guest's request the binding holds is otherwise invisible.
+    let mut log = InterceptLog::start(&cell, run, index, &route, &method, &host, req.uri().path());
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -915,7 +1208,9 @@ async fn intercepted(
             headers,
             cancel: None,
         };
-        return answer(req, call).await;
+        let response = answer(req, call).await;
+        log.answered(response.status().as_u16());
+        return response;
     }
     let declared = req
         .headers()
@@ -930,7 +1225,10 @@ async fn intercepted(
             .await
         {
             Ok(b) => crate::engine_api::RequestBody::Bytes(b.to_bytes()),
-            Err(_) => return plain(413, "an intercepted request's body is longer than it said".into()),
+            Err(_) => {
+                log.answered(413);
+                return plain(413, "an intercepted request's body is longer than it said".into());
+            }
         }
     } else {
         let max = match crate::env_vars::positive_or(
@@ -938,7 +1236,10 @@ async fn intercepted(
             crate::actor::DEFAULT_MAX_REQUEST_BODY_BYTES,
         ) {
             Ok(max) => max,
-            Err(e) => return plain(502, format!("{e:#}")),
+            Err(e) => {
+                log.answered(502);
+                return plain(502, format!("{e:#}"));
+            }
         };
         let chunks = http_body_util::Limited::new(req.into_body(), max)
             .into_data_stream()
@@ -953,7 +1254,10 @@ async fn intercepted(
             });
         match crate::http_streams::register_body_stream(Box::pin(chunks)) {
             Ok(id) => crate::engine_api::RequestBody::Stream(id),
-            Err(e) => return plain(502, e),
+            Err(e) => {
+                log.answered(502);
+                return plain(502, e);
+            }
         }
     };
     let call = crate::engine_api::ServiceFetch {
@@ -968,8 +1272,12 @@ async fn intercepted(
     };
     let response = match runtime.fetch_service(call).await {
         Ok(r) => r,
-        Err(e) => return plain(502, format!("the intercept's binding: {e:#}")),
+        Err(e) => {
+            log.failed(&e);
+            return plain(502, format!("the intercept's binding: {e:#}"));
+        }
     };
+    log.answered(response.status);
     let body: InterceptBody = match response.stream {
         Some(stream) => BodyExt::boxed_unsync(http_body_util::StreamBody::new(stream.map(|chunk| {
             chunk
@@ -1035,6 +1343,67 @@ mod tests {
             assert!(e.contains("XDG_RUNTIME_DIR") && e.contains("107 bytes"), "{e}");
             assert!(intercept_socket(&deep, "node-1", Some(Path::new("relative"))).is_err());
         }
+    }
+
+    /// The engine's tail of a stream that has `end` bytes so far.
+    fn engine_tail(stream: &[u8], end: usize) -> String {
+        String::from_utf8_lossy(&stream[end.saturating_sub(OUTPUT_TAIL_BYTES)..end]).into_owned()
+    }
+
+    /// Goal: reads of a growing stream's tail show each line once, in
+    /// order, whole, past the engine's 64 KiB as before it, with lines
+    /// whose tails begin or end inside a character; the run's last read
+    /// shows the line not yet ended. Replay: a read with nothing new shows
+    /// nothing.
+    #[test]
+    fn output_reads_show_each_line_once() {
+        let mut stream = Vec::new();
+        for i in 0..6000 {
+            stream.extend_from_slice(format!("{{\"at\":{i},\"event\":\"é{}\"}}\n", "x".repeat(i % 37)).as_bytes());
+        }
+        stream.extend_from_slice("no newline yet é".as_bytes());
+        let mut cursor = OutputCursor::default();
+        let mut shown = vec![];
+        // reads at uneven points, some inside a two-byte character
+        let mut end = 0;
+        let mut step = 1;
+        while end < stream.len() {
+            end = (end + step).min(stream.len());
+            step = (step * 7 + 13) % 9000 + 1;
+            let tail = engine_tail(&stream, end);
+            let (lines, missed) = cursor.advance(tail.as_bytes());
+            assert!(!missed, "nothing is missed at {end}");
+            shown.extend(lines);
+            let (again, missed) = cursor.advance(tail.as_bytes());
+            assert!(again.is_empty() && !missed, "a read with nothing new shows nothing");
+        }
+        let tail = engine_tail(&stream, stream.len());
+        shown.extend(cursor.rest(tail.as_bytes()));
+        let want: Vec<String> = String::from_utf8(stream).unwrap().split('\n').map(str::to_string).collect();
+        assert_eq!(shown.len(), want.len());
+        assert_eq!(shown, want);
+    }
+
+    /// Goal: more than the engine keeps between two reads is said to be
+    /// missed, and the newer tail's lines are shown; a first read that is a
+    /// whole tail may have missed some; a line past the cap is cut there.
+    #[test]
+    fn output_past_the_tail_is_missed_and_said() {
+        let line = |i: usize| format!("line {i:08}\n");
+        let stream: String = (0..20_000).map(line).collect();
+        let mut cursor = OutputCursor::default();
+        let (lines, missed) = cursor.advance(engine_tail(stream.as_bytes(), 1000).as_bytes());
+        assert!(!missed && lines.len() == 1000 / 14 && lines[0] == "line 00000000");
+        let (lines, missed) = cursor.advance(engine_tail(stream.as_bytes(), 200_000).as_bytes());
+        assert!(missed, "past 64 KiB between reads");
+        assert_eq!(lines.last().map(String::as_str), Some("line 00014284"));
+        let mut first = OutputCursor::default();
+        assert!(first.advance(engine_tail(stream.as_bytes(), 100_000).as_bytes()).1, "a first read of a whole tail");
+        let mut long = OutputCursor::default();
+        let one = "y".repeat(OUTPUT_LINE_BYTES_MAX + 10);
+        let (lines, _) = long.advance(one.as_bytes());
+        assert_eq!(lines, vec!["y".repeat(OUTPUT_LINE_BYTES_MAX)]);
+        assert_eq!(long.rest(one.as_bytes()), Some("y".repeat(10)));
     }
 
     #[test]
