@@ -323,6 +323,8 @@ pub fn validate() -> anyhow::Result<()> {
     crate::tls_roots::load()?;
     // Reads and checks the node's secrets backend (`CELLD_SECRETS_FILE`).
     crate::secrets::load()?;
+    // Reads and checks the node's models (`CELLD_AI_FILE`).
+    crate::ai::load()?;
     Ok(())
 }
 

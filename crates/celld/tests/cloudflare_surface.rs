@@ -206,7 +206,7 @@ fn bindings_have_workerds_classes_and_stand_ins_reject() {
         refused("output", "this node has no Images");
         refused("info", "this node has no Images");
         refused("browser", "this node has no Browser Rendering");
-        refused("ai", "this node has no Workers AI");
+        refused("ai", "this node has no Workers AI model @cf/meta/llama: name its endpoint in CELLD_AI_FILE");
         assert_eq!(got["asset"]["value"], "an asset", "{got}");
         assert_eq!(got["echo"]["value"], "echo", "{got}");
         assert_eq!(got["blob"]["value"], "v", "{got}");

@@ -135,6 +135,7 @@ the Cloudflare service.
 - [D1](services/d1.md)
 - [R2](services/r2.md)
 - [Secrets Store](services/secrets-store.md)
+- [Workers AI](services/workers-ai.md)
 - [Workflows](services/workflows.md)
 - [Cron Triggers](services/cron-triggers.md)
 - [Static assets](services/static-assets.md)

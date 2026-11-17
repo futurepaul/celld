@@ -7110,6 +7110,7 @@ ops! { OP_NAMES, install_op_functions,
         "__structured_clone" => storage_ops::op_structured_clone,
         "__op_fetch" => op_fetch,
         "__secret_get" => op_secret_get,
+        "__ai_run" => op_ai_run,
         "__r2_head" => r2_ops::op_r2_head,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
@@ -7262,6 +7263,48 @@ fn op_secret_get(
             Err(failure) => serde_json::json!({ "code": failure.code, "message": failure.message }).to_string(),
         })
     });
+    rv.set(promise_for(scope, id));
+}
+
+/// fork: `__ai_run(model, inputsJson)`, the `ai` binding's `run()`
+/// (ai.rs). Resolves to a `Uint8Array` framed by `ai::frame`: the answer's
+/// `{"status", "headers"}` and body (or the `streamId` its body is read
+/// from, `__http_stream_read`), or `{"code", "message"}` saying why there
+/// is none, which the harness throws. The model's endpoint is the node's:
+/// its address stays in this process.
+fn op_ai_run(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    // the model's id and the input's size, then a slot on its endpoint,
+    // before the input is copied out of the isolate: a call refused (too
+    // large, no endpoint, no capacity) copies none of it
+    // UTF-8 bytes, as the host would hold them, counted without a copy
+    let length = |scope: &mut v8::PinScope, v: v8::Local<v8::Value>| v.to_string(scope).map_or(0, |s| s.utf8_length(scope));
+    let model_arg = args.get(0);
+    let model = match length(scope, model_arg) {
+        n if n > 256 => String::new(),
+        _ => model_arg.to_rust_string_lossy(scope),
+    };
+    let input_arg = args.get(1);
+    let input_length = length(scope, input_arg);
+    let id = match crate::ai::reserve(&model, input_length) {
+        Err(answered) => {
+            let framed = crate::ai::frame(answered, |_| None);
+            asyncrt::enqueue(async move { Ok::<_, String>(asyncrt::OpOut::Bytes(framed)) })
+        }
+        Ok(reservation) => {
+            let inputs = input_arg.to_rust_string_lossy(scope);
+            let streams = http_stream_service();
+            asyncrt::enqueue(async move {
+                let answer = reservation.run(&model, &inputs).await;
+                // a `workers-ai` endpoint's body, streamed as a fetch's is
+                let framed = crate::ai::frame(answer, |stream| streams.register_source(HttpStreamSource::Stream(stream)));
+                Ok::<_, String>(asyncrt::OpOut::Bytes(framed))
+            })
+        }
+    };
     rv.set(promise_for(scope, id));
 }
 

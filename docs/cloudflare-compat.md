@@ -28,7 +28,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
 | [Secrets Store](services/secrets-store.md) | **Yes** — read from the node's OpenBao (or Vault), or a `celld dev` file |
-| Workers AI | **No** — an `ai` binding is bound, and its calls reject ([stand-ins](#services-a-node-does-not-run)) |
+| [Workers AI](services/workers-ai.md) | **Partly** — Whisper (`@cf/openai/whisper-large-v3-turbo`) on the operator's whisper.cpp server; every other model rejects |
 | Vectorize | **No** |
 | Hyperdrive | **No** |
 | Browser Rendering | **No** — a `browser` binding is bound, and its calls reject ([stand-ins](#services-a-node-does-not-run)) |
@@ -102,7 +102,8 @@ for Cloudflare does. celld binds each with workerd's class (`SendEmail`,
 - `IMAGES.input()` answers a transformer at once, whose `output()` rejects "this
   node has no Images"; so does `info()`.
 - `BROWSER.fetch()` rejects "this node has no Browser Rendering".
-- `AI.run()` rejects "this node has no Workers AI".
+- `AI.run()` of a model the node's operator names no server for rejects "this
+  node has no Workers AI model …" ([Workers AI](services/workers-ai.md)).
 
 The deploy requires the `service-stand-ins-v1` feature, so a node that predates
 them refuses it.

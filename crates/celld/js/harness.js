@@ -877,10 +877,63 @@ class ImagesBindingImpl {
   }
 }
 
-// `ai`: Workers AI.
+// `ai`: Workers AI. A model the node's operator names (`CELLD_AI_FILE`,
+// ai.rs) is answered by the host from the endpoint the operator names, in
+// the catalog's shapes, a `workers-ai` endpoint's body streamed as it
+// comes; every other model rejects. `returnRawResponse`
+// answers the Response Workers AI would give (a refusal by its status);
+// without it, a JSON answer's object, another's body, or a rejection. The
+// options that only say where a call is logged (`gateway`, `extraHeaders`,
+// `prefix`, `tags`) are taken and have no effect: a node has no AI
+// Gateway. Those that change what a call does (`queueRequest`,
+// `websocket`) are refused by name, and so is a multipart input: celld
+// forwards JSON.
+const __AI_NOT_MODELED = ["queueRequest", "websocket"];
 class Ai {
-  async run(_model, _inputs, _options) {
-    throw __noService("Workers AI");
+  async run(model, inputs, options) {
+    const opts = options ?? {};
+    for (const key of __AI_NOT_MODELED) {
+      if (opts[key]) throw new Error(`celld's Workers AI does not take the option ${key}`);
+    }
+    if (inputs?.multipart !== undefined) {
+      throw new Error("celld's Workers AI takes JSON inputs, not a multipart form");
+    }
+    let body;
+    try {
+      body = JSON.stringify(inputs ?? {});
+    } catch {
+      throw new Error("celld's Workers AI takes JSON inputs");
+    }
+    // ai::frame: the metadata's length, the metadata, the body
+    const framed = await __ai_run(String(model), body);
+    const length = new DataView(framed.buffer, framed.byteOffset, 4).getUint32(0);
+    const meta = JSON.parse(new TextDecoder().decode(framed.subarray(4, 4 + length)));
+    if (meta.code !== undefined) {
+      const error = new Error(meta.message);
+      error.name = "AiError";
+      error.code = meta.code;
+      throw error;
+    }
+    // a `workers-ai` endpoint's body comes as it is read, a chat's events
+    // one by one; celld's own answers come whole
+    const answered = meta.streamId !== undefined ? new CelldHttpBodyStream(meta.streamId) : framed.subarray(4 + length);
+    const response = new Response(answered, { status: meta.status, headers: meta.headers });
+    if (opts.returnRawResponse) return response;
+    // its media type, without parameters or case: JSON's, or a +json one
+    const essence = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    const json = essence === "application/json" || essence.endsWith("+json");
+    if (meta.status !== 200) {
+      let first;
+      try {
+        first = JSON.parse(await response.text())?.errors?.[0];
+      } catch {
+        // an answer that is not JSON says nothing more
+      }
+      const error = new Error(`${first?.code ?? meta.status}: ${first?.message ?? "the model refused the call"}`);
+      error.name = "InferenceUpstreamError";
+      throw error;
+    }
+    return json ? await response.json() : response.body;
   }
 }
 

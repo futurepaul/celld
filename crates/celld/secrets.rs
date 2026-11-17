@@ -140,7 +140,7 @@ fn segments(v: &str) -> bool {
 
 /// Whether `addr` is an origin: `http(s)://host[:port]`, no path, user or
 /// query.
-fn origin(addr: &str) -> bool {
+pub(crate) fn origin(addr: &str) -> bool {
     let Some(rest) = addr.strip_prefix("http://").or_else(|| addr.strip_prefix("https://")) else {
         return false;
     };

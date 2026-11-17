@@ -96,6 +96,7 @@ pub(crate) mod r2_store;
 pub mod replication;
 pub mod runtime;
 pub mod secrets;
+pub mod ai;
 pub mod startup;
 pub mod storage;
 pub mod telemetry;
